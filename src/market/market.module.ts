@@ -6,6 +6,8 @@ import { MarketController } from './market.controller';
 import { MarketService, TWELVE_DATA_HTTP } from './market.service';
 import { IndicatorsController } from './indicators/indicators.controller';
 import { IndicatorsService } from './indicators/indicators.service';
+import { SignalsController } from './signals/signals.controller';
+import { SignalsService } from './signals/signals.service';
 
 @Module({
   imports: [
@@ -22,10 +24,11 @@ import { IndicatorsService } from './indicators/indicators.service';
       }),
     }),
   ],
-  controllers: [MarketController, IndicatorsController],
+  controllers: [MarketController, IndicatorsController, SignalsController],
   providers: [
     MarketService,
     IndicatorsService,
+    SignalsService,
     {
       // A dedicated axios client for Twelve Data (historical candles),
       // separate from the Finnhub-configured HttpService above.
