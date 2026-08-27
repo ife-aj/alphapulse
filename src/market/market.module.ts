@@ -4,6 +4,8 @@ import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
 import { MarketController } from './market.controller';
 import { MarketService, TWELVE_DATA_HTTP } from './market.service';
+import { IndicatorsController } from './indicators/indicators.controller';
+import { IndicatorsService } from './indicators/indicators.service';
 
 @Module({
   imports: [
@@ -20,9 +22,10 @@ import { MarketService, TWELVE_DATA_HTTP } from './market.service';
       }),
     }),
   ],
-  controllers: [MarketController],
+  controllers: [MarketController, IndicatorsController],
   providers: [
     MarketService,
+    IndicatorsService,
     {
       // A dedicated axios client for Twelve Data (historical candles),
       // separate from the Finnhub-configured HttpService above.
