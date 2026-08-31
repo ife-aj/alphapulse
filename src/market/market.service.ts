@@ -1,4 +1,10 @@
-import { Inject, Injectable } from '@nestjs/common';
+import {
+  HttpException,
+  HttpStatus,
+  Inject,
+  Injectable,
+  Logger,
+} from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import type { AxiosInstance } from 'axios';
@@ -48,6 +54,8 @@ interface TwelveDataTimeSeriesResponse {
 
 @Injectable()
 export class MarketService {
+  private readonly logger = new Logger(MarketService.name);
+
   constructor(
     private readonly http: HttpService,
     private readonly config: ConfigService,
@@ -72,6 +80,7 @@ export class MarketService {
     days: number = DEFAULT_CANDLE_DAYS,
   ): Promise<Candle[]> {
     const normalized = symbol.trim().toUpperCase();
+    const startedAt = Date.now();
 
     let payload: unknown;
     try {
@@ -85,25 +94,41 @@ export class MarketService {
       });
       payload = response.data;
     } catch (error) {
-      throw toProviderHttpException(error, { symbol: normalized });
+      const exception = toProviderHttpException(error, { symbol: normalized });
+      this.logProviderFailure(exception, 'Twelve Data', normalized, startedAt);
+      throw exception;
     }
 
     if (!this.isTwelveDataResponse(payload)) {
+      this.logger.error(
+        `Twelve Data returned a malformed response for ${normalized} (unexpected payload shape)`,
+      );
       throw malformedProviderResponseException();
     }
 
     // Twelve Data reports bad symbols, plan limits, and rate limits as HTTP 200 + status:'error'.
     if (payload.status === 'error') {
-      throw toProviderBodyHttpException(payload, { symbol: normalized });
+      const exception = toProviderBodyHttpException(payload, {
+        symbol: normalized,
+      });
+      this.logProviderFailure(exception, 'Twelve Data', normalized, startedAt);
+      throw exception;
     }
 
     // A valid response with no candles means there is no market data at all.
     const values = payload.values;
     if (!values || values.length === 0) {
+      this.logger.debug(
+        `Twelve Data returned no candles for ${normalized}; treating as unknown symbol`,
+      );
       throw unknownSymbolException(normalized);
     }
 
-    return this.mapCandles(values);
+    const candles = this.mapCandles(values);
+    this.logger.debug(
+      `Fetched ${candles.length} candles for ${normalized} (${days}d) in ${Date.now() - startedAt}ms`,
+    );
+    return candles;
   }
 
   /** Structural guard on the raw Twelve Data payload before we trust it. */
@@ -156,6 +181,9 @@ export class MarketService {
       !Number.isFinite(close) ||
       !Number.isFinite(volume)
     ) {
+      this.logger.error(
+        `Twelve Data returned a malformed candle for ${v.datetime} (non-numeric OHLCV)`,
+      );
       throw malformedProviderResponseException();
     }
 
@@ -172,6 +200,7 @@ export class MarketService {
 
   private async fetchQuote(symbol: string): Promise<Quote> {
     const normalized = symbol.trim().toUpperCase();
+    const startedAt = Date.now();
 
     let data: unknown;
     try {
@@ -182,19 +211,31 @@ export class MarketService {
       );
       data = response.data;
     } catch (error) {
-      throw toProviderHttpException(error, { symbol: normalized });
+      const exception = toProviderHttpException(error, { symbol: normalized });
+      this.logProviderFailure(exception, 'Finnhub', normalized, startedAt);
+      throw exception;
     }
 
     if (!this.isFinnhubQuote(data)) {
+      this.logger.error(
+        `Finnhub returned a malformed response for ${normalized} (unexpected quote shape)`,
+      );
       throw malformedProviderResponseException();
     }
 
     // Finnhub answers unknown symbols with HTTP 200 + all-zero fields, not a 404.
     if (data.c === 0 && data.t === 0) {
+      this.logger.debug(
+        `Finnhub returned an all-zero quote for ${normalized}; treating as unknown symbol`,
+      );
       throw unknownSymbolException(normalized);
     }
 
-    return this.mapQuote(normalized, data);
+    const quote = this.mapQuote(normalized, data);
+    this.logger.debug(
+      `Fetched quote for ${normalized} in ${Date.now() - startedAt}ms`,
+    );
+    return quote;
   }
 
   /** Structural + numeric guard on the raw Finnhub payload before we trust it. */
@@ -216,6 +257,9 @@ export class MarketService {
     // never escape the translation layer as a RangeError from toISOString().
     const timestamp = data.t * 1000;
     if (Math.abs(timestamp) > 8_640_000_000_000_000) {
+      this.logger.error(
+        `Finnhub returned an out-of-range timestamp for ${symbol}`,
+      );
       throw malformedProviderResponseException();
     }
 
@@ -226,6 +270,32 @@ export class MarketService {
       changePercent: data.dp ?? 0,
       timestamp: new Date(timestamp).toISOString(),
     };
+  }
+
+  /**
+   * Log a provider failure at a level matched to its AlphaPulse status:
+   * 404 (expected unknown symbol / empty data) -> debug; 500 (credential or
+   * config problem) -> error; 429/502/503/504 (recoverable upstream
+   * conditions) -> warn. The raw Axios error is never logged — it can carry
+   * the provider URL and API key.
+   */
+  private logProviderFailure(
+    exception: HttpException,
+    provider: string,
+    symbol: string,
+    startedAt: number,
+  ): void {
+    const elapsedMs = Date.now() - startedAt;
+    const status = exception.getStatus();
+    const detail = `Upstream ${provider} request for ${symbol} failed (${status}) after ${elapsedMs}ms`;
+
+    if (status === HttpStatus.NOT_FOUND) {
+      this.logger.debug(detail);
+    } else if (status === HttpStatus.INTERNAL_SERVER_ERROR) {
+      this.logger.error(detail);
+    } else {
+      this.logger.warn(detail);
+    }
   }
 
   /** Naive placeholder strategy: act on the latest percentage move. */

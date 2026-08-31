@@ -1,4 +1,4 @@
-import { HttpException, HttpStatus, NotFoundException } from '@nestjs/common';
+import { HttpException, HttpStatus, Logger, NotFoundException } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
 import { AxiosError, type AxiosInstance, AxiosResponse } from 'axios';
@@ -59,6 +59,12 @@ describe('MarketService', () => {
   let twelveDataGet: jest.Mock;
 
   beforeEach(() => {
+    jest.clearAllMocks();
+    // Silence the service's own logger (it would otherwise print during tests)
+    // and expose spies so individual tests can assert the log level.
+    jest.spyOn(Logger.prototype, 'debug').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
     httpGet = jest.fn();
     twelveDataGet = jest.fn();
     const http = { get: httpGet } as unknown as HttpService;
@@ -322,5 +328,102 @@ describe('MarketService', () => {
     expect((error as HttpException).message).not.toContain('timeout of');
     expect((error as HttpException).message).not.toContain('ECONNABORTED');
     expect((error as HttpException).message).not.toContain('Finnhub');
+  });
+
+  describe('logging', () => {
+    it('logs a successful quote fetch at debug level', async () => {
+      httpGet.mockReturnValue(of(asAxiosResponse(finnhubQuote())));
+
+      await service.getQuotes(['AAPL']);
+
+      expect(jest.spyOn(Logger.prototype, 'debug')).toHaveBeenCalledWith(
+        expect.stringMatching(/^Fetched quote for AAPL in \d+ms$/),
+      );
+    });
+
+    it('logs a successful candle fetch at debug level', async () => {
+      twelveDataGet.mockResolvedValue({ data: twelveDataSeries() });
+
+      await service.getCandles('aapl', 2);
+
+      expect(jest.spyOn(Logger.prototype, 'debug')).toHaveBeenCalledWith(
+        expect.stringMatching(/^Fetched 2 candles for AAPL \(2d\) in \d+ms$/),
+      );
+    });
+
+    it('logs a provider rate limit at warn level', async () => {
+      const rateLimitError = new AxiosError('Too Many Requests');
+      rateLimitError.response = {
+        status: HttpStatus.TOO_MANY_REQUESTS,
+      } as AxiosResponse;
+      httpGet.mockReturnValue(throwError(() => rateLimitError));
+
+      await service.getSignal('AAPL').catch(() => undefined);
+
+      expect(jest.spyOn(Logger.prototype, 'warn')).toHaveBeenCalledWith(
+        expect.stringMatching(/Upstream Finnhub request for AAPL failed \(429\)/),
+      );
+    });
+
+    it('logs a provider timeout at warn level', async () => {
+      const timeoutError = new AxiosError(
+        'timeout of 5000ms exceeded',
+        'ECONNABORTED',
+      );
+      twelveDataGet.mockRejectedValue(timeoutError);
+
+      await service.getCandles('AAPL', 30).catch(() => undefined);
+
+      expect(jest.spyOn(Logger.prototype, 'warn')).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /Upstream Twelve Data request for AAPL failed \(504\)/,
+        ),
+      );
+    });
+
+    it('logs a malformed provider payload at error level', async () => {
+      httpGet.mockReturnValue(of(asAxiosResponse({})));
+
+      await service.getSignal('AAPL').catch(() => undefined);
+
+      expect(jest.spyOn(Logger.prototype, 'error')).toHaveBeenCalledWith(
+        expect.stringMatching(/Finnhub returned a malformed response for AAPL/),
+      );
+    });
+
+    it('never logs API keys, provider URLs, or Axios internals', async () => {
+      // Simulate a configured key sitting in the axios params/URL on the error.
+      const withKeyConfig = {
+        get: (key: string) =>
+          key === 'TWELVE_DATA_API_KEY' ? 'td_test_SECRET_KEY' : undefined,
+      } as unknown as ConfigService;
+      const http = { get: httpGet } as unknown as HttpService;
+      const twelveData = { get: twelveDataGet } as unknown as AxiosInstance;
+      const serviceWithKey = new MarketService(http, withKeyConfig, twelveData);
+
+      const timeoutError = new AxiosError(
+        'timeout of 5000ms exceeded',
+        'ECONNABORTED',
+      );
+      (timeoutError as unknown as { config: unknown }).config = {
+        url: 'https://api.twelvedata.com/time_series?apikey=td_test_SECRET_KEY',
+        params: { apikey: 'td_test_SECRET_KEY' },
+      };
+      twelveDataGet.mockRejectedValue(timeoutError);
+
+      await serviceWithKey.getCandles('AAPL', 30).catch(() => undefined);
+
+      const captured = [
+        ...jest.spyOn(Logger.prototype, 'warn').mock.calls,
+        ...jest.spyOn(Logger.prototype, 'error').mock.calls,
+      ]
+        .map((call) => String(call[0]))
+        .join('\n');
+
+      expect(captured).not.toContain('td_test_SECRET_KEY');
+      expect(captured).not.toContain('apikey');
+      expect(captured).not.toContain('api.twelvedata.com');
+      expect(captured).not.toContain('ECONNABORTED');
+    });
   });
 });
