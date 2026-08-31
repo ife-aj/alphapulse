@@ -128,6 +128,7 @@ describe('MarketService', () => {
     expect((error as HttpException).getStatus()).toBe(
       HttpStatus.TOO_MANY_REQUESTS,
     );
+    expect((error as HttpException).message).not.toContain('Finnhub');
   });
 
   it('maps a Twelve Data time series into chronological Candle[]', async () => {
@@ -185,5 +186,141 @@ describe('MarketService', () => {
     expect((error as HttpException).getStatus()).toBe(
       HttpStatus.TOO_MANY_REQUESTS,
     );
+    expect((error as HttpException).message).not.toContain('Twelve Data');
+  });
+
+  it('maps a Twelve Data HTTP 500 to a 502 response', async () => {
+    const serverError = new AxiosError('Internal Server Error');
+    serverError.response = {
+      status: HttpStatus.INTERNAL_SERVER_ERROR,
+    } as AxiosResponse;
+    twelveDataGet.mockRejectedValue(serverError);
+
+    const error = await service.getCandles('AAPL', 30).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(HttpStatus.BAD_GATEWAY);
+  });
+
+  it('maps a Twelve Data HTTP 503 to a 503 response', async () => {
+    const unavailable = new AxiosError('Service Unavailable');
+    unavailable.response = {
+      status: HttpStatus.SERVICE_UNAVAILABLE,
+    } as AxiosResponse;
+    twelveDataGet.mockRejectedValue(unavailable);
+
+    const error = await service.getCandles('AAPL', 30).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(
+      HttpStatus.SERVICE_UNAVAILABLE,
+    );
+  });
+
+  it('does not claim a raw HTTP 400 is an unknown symbol (maps to 502)', async () => {
+    const badRequest = new AxiosError('Bad Request');
+    badRequest.response = { status: HttpStatus.BAD_REQUEST } as AxiosResponse;
+    twelveDataGet.mockRejectedValue(badRequest);
+
+    const error = await service.getCandles('AAPL', 30).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(HttpStatus.BAD_GATEWAY);
+    expect((error as HttpException).message).not.toContain('No market data');
+  });
+
+  it('maps a Twelve Data timeout to a 504 response', async () => {
+    const timeoutError = new AxiosError(
+      'timeout of 5000ms exceeded',
+      'ECONNABORTED',
+    );
+    twelveDataGet.mockRejectedValue(timeoutError);
+
+    const error = await service.getCandles('AAPL', 30).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(
+      HttpStatus.GATEWAY_TIMEOUT,
+    );
+  });
+
+  it('maps a Finnhub network failure to a 503 response', async () => {
+    const networkError = new AxiosError('connect ECONNREFUSED', 'ECONNREFUSED');
+    httpGet.mockReturnValue(throwError(() => networkError));
+
+    const error = await service.getSignal('AAPL').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(
+      HttpStatus.SERVICE_UNAVAILABLE,
+    );
+  });
+
+  it('maps a Finnhub timeout to a 504 response', async () => {
+    const timeoutError = new AxiosError(
+      'timeout of 5000ms exceeded',
+      'ECONNABORTED',
+    );
+    httpGet.mockReturnValue(throwError(() => timeoutError));
+
+    const error = await service.getSignal('AAPL').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(
+      HttpStatus.GATEWAY_TIMEOUT,
+    );
+  });
+
+  it('maps a malformed Finnhub payload to a 502 response', async () => {
+    httpGet.mockReturnValue(of(asAxiosResponse({})));
+
+    const error = await service.getSignal('AAPL').catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(HttpStatus.BAD_GATEWAY);
+  });
+
+  it('maps a malformed Twelve Data payload to a 502 response', async () => {
+    twelveDataGet.mockResolvedValue({
+      data: twelveDataSeries({
+        values: [
+          {
+            datetime: '2024-01-03',
+            open: 'abc',
+            high: '185.88',
+            low: '183.43',
+            close: '184.25',
+            volume: '58414500',
+          },
+        ],
+      }),
+    });
+
+    const error = await service.getCandles('AAPL', 30).catch((e: unknown) => e);
+
+    expect(error).toBeInstanceOf(HttpException);
+    expect((error as HttpException).getStatus()).toBe(HttpStatus.BAD_GATEWAY);
+  });
+
+  it('throws NotFoundException when Twelve Data returns no candles', async () => {
+    twelveDataGet.mockResolvedValue({ data: twelveDataSeries({ values: [] }) });
+
+    await expect(service.getCandles('AAPL', 30)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
+
+  it('keeps public error messages neutral (no provider names, no Axios internals)', async () => {
+    const timeoutError = new AxiosError(
+      'timeout of 5000ms exceeded',
+      'ECONNABORTED',
+    );
+    httpGet.mockReturnValue(throwError(() => timeoutError));
+
+    const error = await service.getSignal('AAPL').catch((e: unknown) => e);
+
+    expect((error as HttpException).message).not.toContain('timeout of');
+    expect((error as HttpException).message).not.toContain('ECONNABORTED');
+    expect((error as HttpException).message).not.toContain('Finnhub');
   });
 });

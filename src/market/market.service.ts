@@ -1,16 +1,15 @@
-import {
-  HttpException,
-  HttpStatus,
-  Inject,
-  Injectable,
-  NotFoundException,
-  ServiceUnavailableException,
-} from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { ConfigService } from '@nestjs/config';
-import { AxiosError, type AxiosInstance } from 'axios';
+import type { AxiosInstance } from 'axios';
 import { firstValueFrom } from 'rxjs';
 import { Candle, Quote, Signal, SignalAction } from './market.types';
+import {
+  malformedProviderResponseException,
+  toProviderBodyHttpException,
+  toProviderHttpException,
+  unknownSymbolException,
+} from './provider-errors';
 
 const FALLBACK_SYMBOLS = 'AAPL,MSFT,NVDA,TSLA,AMZN,GOOGL';
 const DEFAULT_CANDLE_DAYS = 30;
@@ -74,66 +73,93 @@ export class MarketService {
   ): Promise<Candle[]> {
     const normalized = symbol.trim().toUpperCase();
 
-    let payload: TwelveDataTimeSeriesResponse;
+    let payload: unknown;
     try {
-      const response = await this.twelveData.get<TwelveDataTimeSeriesResponse>(
-        '/time_series',
-        {
-          params: {
-            symbol: normalized,
-            interval: '1day',
-            outputsize: days,
-            apikey: this.config.get<string>('TWELVE_DATA_API_KEY') ?? '',
-          },
+      const response = await this.twelveData.get('/time_series', {
+        params: {
+          symbol: normalized,
+          interval: '1day',
+          outputsize: days,
+          apikey: this.config.get<string>('TWELVE_DATA_API_KEY') ?? '',
         },
-      );
+      });
       payload = response.data;
     } catch (error) {
-      throw this.toHttpException(error, normalized, 'Twelve Data');
+      throw toProviderHttpException(error, { symbol: normalized });
+    }
+
+    if (!this.isTwelveDataResponse(payload)) {
+      throw malformedProviderResponseException();
     }
 
     // Twelve Data reports bad symbols, plan limits, and rate limits as HTTP 200 + status:'error'.
     if (payload.status === 'error') {
-      throw this.toTwelveDataError(payload, normalized);
+      throw toProviderBodyHttpException(payload, { symbol: normalized });
     }
 
-    return this.mapCandles(payload.values ?? []);
+    // A valid response with no candles means there is no market data at all.
+    const values = payload.values;
+    if (!values || values.length === 0) {
+      throw unknownSymbolException(normalized);
+    }
+
+    return this.mapCandles(values);
+  }
+
+  /** Structural guard on the raw Twelve Data payload before we trust it. */
+  private isTwelveDataResponse(
+    value: unknown,
+  ): value is TwelveDataTimeSeriesResponse {
+    if (typeof value !== 'object' || value === null) return false;
+    const v = value as Record<string, unknown>;
+    if (v.status !== 'ok' && v.status !== 'error') return false;
+    if (v.status === 'ok') {
+      // `values` is optional; when present it must be an array of candles whose
+      // OHLCV fields are strings (Twelve Data's wire format).
+      if (v.values !== undefined && !Array.isArray(v.values)) return false;
+      if (
+        Array.isArray(v.values) &&
+        !v.values.every((candle) => this.isTwelveDataCandle(candle))
+      ) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  private isTwelveDataCandle(value: unknown): boolean {
+    if (typeof value !== 'object' || value === null) return false;
+    const v = value as Record<string, unknown>;
+    return ['datetime', 'open', 'high', 'low', 'close', 'volume'].every(
+      (key) => typeof v[key] === 'string',
+    );
   }
 
   private mapCandles(values: TwelveDataValue[]): Candle[] {
     // Twelve Data returns newest-first; reverse to chronological (oldest-first) order.
-    return values
-      .map((v) => ({
-        date: v.datetime,
-        open: Number(v.open),
-        high: Number(v.high),
-        low: Number(v.low),
-        close: Number(v.close),
-        volume: Number(v.volume),
-      }))
-      .reverse();
+    return values.map((candle) => this.toCandle(candle)).reverse();
   }
 
-  /** Turn Twelve Data's 200-with-error-body into the right HTTP status for our API. */
-  private toTwelveDataError(
-    payload: TwelveDataTimeSeriesResponse,
-    symbol: string,
-  ): HttpException {
-    if (payload.code === HttpStatus.TOO_MANY_REQUESTS) {
-      return new HttpException(
-        'Twelve Data rate limit exceeded. Please retry shortly.',
-        HttpStatus.TOO_MANY_REQUESTS,
-      );
-    }
+  private toCandle(v: TwelveDataValue): Candle {
+    const open = Number(v.open);
+    const high = Number(v.high);
+    const low = Number(v.low);
+    const close = Number(v.close);
+    const volume = Number(v.volume);
+
+    // A non-numeric OHLCV field means the provider sent something we can't
+    // interpret; fail loudly rather than leaking NaN into the response.
     if (
-      payload.code === HttpStatus.NOT_FOUND ||
-      payload.code === HttpStatus.BAD_REQUEST
+      !Number.isFinite(open) ||
+      !Number.isFinite(high) ||
+      !Number.isFinite(low) ||
+      !Number.isFinite(close) ||
+      !Number.isFinite(volume)
     ) {
-      return new NotFoundException(`No historical data for symbol "${symbol}"`);
+      throw malformedProviderResponseException();
     }
-    return new ServiceUnavailableException(
-      `Failed to fetch candles for "${symbol}" from Twelve Data.`,
-    );
+
+    return { date: v.datetime, open, high, low, close, volume };
   }
 
   private getDefaultSymbols(): string[] {
@@ -147,33 +173,58 @@ export class MarketService {
   private async fetchQuote(symbol: string): Promise<Quote> {
     const normalized = symbol.trim().toUpperCase();
 
-    let data: FinnhubQuoteResponse;
+    let data: unknown;
     try {
       const response = await firstValueFrom(
-        this.http.get<FinnhubQuoteResponse>('/quote', {
+        this.http.get('/quote', {
           params: { symbol: normalized },
         }),
       );
       data = response.data;
     } catch (error) {
-      throw this.toHttpException(error, normalized, 'Finnhub');
+      throw toProviderHttpException(error, { symbol: normalized });
+    }
+
+    if (!this.isFinnhubQuote(data)) {
+      throw malformedProviderResponseException();
     }
 
     // Finnhub answers unknown symbols with HTTP 200 + all-zero fields, not a 404.
     if (data.c === 0 && data.t === 0) {
-      throw new NotFoundException(`No market data for symbol "${normalized}"`);
+      throw unknownSymbolException(normalized);
     }
 
     return this.mapQuote(normalized, data);
   }
 
+  /** Structural + numeric guard on the raw Finnhub payload before we trust it. */
+  private isFinnhubQuote(value: unknown): value is FinnhubQuoteResponse {
+    if (typeof value !== 'object' || value === null) return false;
+    const v = value as Record<string, unknown>;
+    return (
+      typeof v.c === 'number' &&
+      Number.isFinite(v.c) &&
+      typeof v.t === 'number' &&
+      Number.isFinite(v.t) &&
+      (typeof v.d === 'number' || v.d === null) &&
+      (typeof v.dp === 'number' || v.dp === null)
+    );
+  }
+
   private mapQuote(symbol: string, data: FinnhubQuoteResponse): Quote {
+    // Finnhub `t` is in seconds. Guard the range so an out-of-range value can
+    // never escape the translation layer as a RangeError from toISOString().
+    const timestamp = data.t * 1000;
+    if (Math.abs(timestamp) > 8_640_000_000_000_000) {
+      throw malformedProviderResponseException();
+    }
+
     return {
       symbol,
       price: data.c,
       change: data.d ?? 0,
       changePercent: data.dp ?? 0,
-      timestamp: new Date(data.t * 1000).toISOString(), // Finnhub `t` is in seconds
+      timestamp: new Date(timestamp).toISOString(),
     };
   }
 
@@ -192,24 +243,5 @@ export class MarketService {
       rationale: `Derived from a ${quote.changePercent}% move on the latest quote.`,
       generatedAt: new Date().toISOString(),
     };
-  }
-
-  private toHttpException(
-    error: unknown,
-    symbol: string,
-    provider: string,
-  ): HttpException {
-    if (
-      error instanceof AxiosError &&
-      error.response?.status === HttpStatus.TOO_MANY_REQUESTS
-    ) {
-      return new HttpException(
-        `${provider} rate limit exceeded. Please retry shortly.`,
-        HttpStatus.TOO_MANY_REQUESTS,
-      );
-    }
-    return new ServiceUnavailableException(
-      `Failed to fetch market data for "${symbol}" from ${provider}.`,
-    );
   }
 }

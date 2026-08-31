@@ -9,6 +9,16 @@ import { IndicatorsService } from './indicators/indicators.service';
 import { SignalsController } from './signals/signals.controller';
 import { SignalsService } from './signals/signals.service';
 
+/**
+ * Outbound timeout (ms) for market-data provider requests. Env-tunable via
+ * MARKET_PROVIDER_TIMEOUT_MS so a slow provider can never pin a request open
+ * indefinitely; applied to both the Finnhub and Twelve Data clients.
+ */
+function providerTimeoutMs(config: ConfigService): number {
+  const raw = Number(config.get<string>('MARKET_PROVIDER_TIMEOUT_MS') ?? '5000');
+  return Number.isFinite(raw) && raw > 0 ? raw : 5000;
+}
+
 @Module({
   imports: [
     // Configure the axios instance once: Finnhub base URL + auth header.
@@ -17,7 +27,7 @@ import { SignalsService } from './signals/signals.service';
       useFactory: (config: ConfigService) => ({
         baseURL:
           config.get<string>('FINNHUB_BASE_URL') ?? 'https://finnhub.io/api/v1',
-        timeout: 5000,
+        timeout: providerTimeoutMs(config),
         headers: {
           'X-Finnhub-Token': config.get<string>('FINNHUB_API_KEY') ?? '',
         },
@@ -39,7 +49,7 @@ import { SignalsService } from './signals/signals.service';
           baseURL:
             config.get<string>('TWELVE_DATA_BASE_URL') ??
             'https://api.twelvedata.com',
-          timeout: 5000,
+          timeout: providerTimeoutMs(config),
         }),
     },
   ],
