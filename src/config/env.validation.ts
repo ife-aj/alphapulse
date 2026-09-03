@@ -18,6 +18,17 @@ export function validateEnv(config: Record<string, unknown>): Record<string, unk
   requireNonEmpty(config, errors, 'FINNHUB_API_KEY');
   requireNonEmpty(config, errors, 'TWELVE_DATA_API_KEY');
 
+  // Supabase project URL + anon/publishable key. Unlike the provider keys there
+  // is no sensible fallback URL to guess, so both are required. The anon key is
+  // a JWT; a non-empty check matches how the other API keys are validated.
+  const supabaseUrl = config['SUPABASE_URL'];
+  if (typeof supabaseUrl !== 'string' || supabaseUrl.trim() === '') {
+    errors.push('SUPABASE_URL must be a non-empty http(s) URL');
+  } else if (!isHttpUrl(supabaseUrl)) {
+    errors.push('SUPABASE_URL must be a valid http(s) URL');
+  }
+  requireNonEmpty(config, errors, 'SUPABASE_ANON_KEY');
+
   if (config['MARKET_PROVIDER_TIMEOUT_MS'] !== undefined && !isPositiveInt(config['MARKET_PROVIDER_TIMEOUT_MS'])) {
     errors.push('MARKET_PROVIDER_TIMEOUT_MS must be a positive integer (ms)');
   }

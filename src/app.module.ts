@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { HealthModule } from './health/health.module';
 import { MarketModule } from './market/market.module';
+import { SupabaseModule } from './supabase/supabase.module';
 import { validateEnv } from './config/env.validation';
 
 @Module({
@@ -11,6 +12,8 @@ import { validateEnv } from './config/env.validation';
     ConfigModule.forRoot({ isGlobal: true, validate: validateEnv }),
     HealthModule,
     MarketModule,
+    // Foundation for Auth/Watchlist: exports a configured Supabase client.
+    SupabaseModule,
   ],
 })
 export class AppModule {}

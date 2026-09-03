@@ -8,6 +8,8 @@ const validConfig: Record<string, unknown> = {
   MARKET_PROVIDER_TIMEOUT_MS: '5000',
   FINNHUB_BASE_URL: 'https://finnhub.io/api/v1',
   TWELVE_DATA_BASE_URL: 'https://api.twelvedata.com',
+  SUPABASE_URL: 'https://abcdefghijk.supabase.co',
+  SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.dummy-signature',
   DEFAULT_SYMBOLS: 'AAPL,MSFT,NVDA',
 };
 
@@ -20,10 +22,12 @@ describe('validateEnv', () => {
     expect(validateEnv(validConfig)).toEqual(validConfig);
   });
 
-  it('accepts all optional variables being absent', () => {
+  it('accepts the required keys without any optional variable', () => {
     const minimal: Record<string, unknown> = {
       FINNHUB_API_KEY: 'finnhub-key',
       TWELVE_DATA_API_KEY: 'twelve-data-key',
+      SUPABASE_URL: 'https://abcdefghijk.supabase.co',
+      SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.dummy-signature',
     };
     expect(() => validateEnv(minimal)).not.toThrow();
   });
@@ -38,6 +42,27 @@ describe('validateEnv', () => {
     expect(() =>
       validateEnv({ ...validConfig, TWELVE_DATA_API_KEY: '   ' }),
     ).toThrow(/TWELVE_DATA_API_KEY/);
+  });
+
+  it('throws when SUPABASE_URL is missing', () => {
+    const broken = { ...validConfig };
+    delete broken.SUPABASE_URL;
+    expect(() => validateEnv(broken)).toThrow(/SUPABASE_URL/);
+  });
+
+  it.each(['not-a-url', 'ftp://supabase.co', '', '   '])(
+    'throws when SUPABASE_URL is %s (not an http(s) URL)',
+    (value) => {
+      expect(() =>
+        validateEnv({ ...validConfig, SUPABASE_URL: value }),
+      ).toThrow(/SUPABASE_URL/);
+    },
+  );
+
+  it('throws when SUPABASE_ANON_KEY is blank or whitespace-only', () => {
+    expect(() =>
+      validateEnv({ ...validConfig, SUPABASE_ANON_KEY: '   ' }),
+    ).toThrow(/SUPABASE_ANON_KEY/);
   });
 
   it.each(['abc', '-5', '0', '5.5'])(
@@ -84,6 +109,7 @@ describe('validateEnv', () => {
     expect(error).toBeDefined();
     expect(error!.message).toContain('FINNHUB_API_KEY');
     expect(error!.message).toContain('TWELVE_DATA_API_KEY');
+    expect(error!.message).toContain('SUPABASE_URL');
     expect(error!.message).toContain('PORT');
   });
 });
