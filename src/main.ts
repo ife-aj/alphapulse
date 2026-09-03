@@ -1,6 +1,7 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
@@ -17,6 +18,20 @@ async function bootstrap() {
       transform: true, // turn plain payloads into typed DTO instances
     }),
   );
+
+  // OpenAPI docs at /api/docs (Swagger UI) with bearer-token auth for
+  // protected routes such as GET /api/auth/me.
+  const swaggerConfig = new DocumentBuilder()
+    .setTitle('AlphaPulse API')
+    .setDescription('Market data and Supabase-backed authentication.')
+    .setVersion('0.0.1')
+    .addBearerAuth(
+      { type: 'http', scheme: 'bearer', bearerFormat: 'JWT' },
+      'bearer',
+    )
+    .build();
+  const swaggerDocument = SwaggerModule.createDocument(app, swaggerConfig);
+  SwaggerModule.setup('api/docs', app, swaggerDocument);
 
   const configService = app.get(ConfigService);
   const port = configService.get<string>('PORT') ?? '3000';

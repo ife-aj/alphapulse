@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { AuthModule } from './auth/auth.module';
 import { HealthModule } from './health/health.module';
 import { MarketModule } from './market/market.module';
 import { SupabaseModule } from './supabase/supabase.module';
@@ -14,6 +15,8 @@ import { validateEnv } from './config/env.validation';
     MarketModule,
     // Foundation for Auth/Watchlist: exports a configured Supabase client.
     SupabaseModule,
+    // Supabase-backed register/login + guarded /auth/me.
+    AuthModule,
   ],
 })
 export class AppModule {}
