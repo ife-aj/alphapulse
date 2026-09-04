@@ -2,13 +2,17 @@
 
 NestJS backend for AlphaPulse — a stock-market signal engine. It authenticates
 users with Supabase Auth, serves market data (quotes/indicators) from Finnhub
-and Twelve Data, and backs user profiles and watchlists with a Supabase
-Postgres database protected by Row Level Security.
+and Twelve Data, and backs user profiles, watchlists, and portfolio holdings
+with a Supabase Postgres database protected by Row Level Security.
 
 **Status of this slice:** profiles, watchlists, and watchlist items exist in the
 database with full RLS, and the API exposes authenticated watchlist endpoints
 (create, list, rename, delete, add/remove symbols) alongside auth and
-market-data endpoints.
+market-data endpoints. The `portfolios` and `holdings` tables now exist in the
+database too — positions are recorded manually, and prices and performance are
+computed at request time rather than stored (see
+[Portfolio tracking](#portfolio-tracking)) — but their API endpoints are not
+implemented yet.
 
 ## Architecture
 
@@ -84,8 +88,12 @@ your Supabase project.
 1. Open your project in the [Supabase dashboard](https://supabase.com/dashboard).
 2. Go to **SQL Editor** and create a new query.
 3. Paste the entire contents of
-   `supabase/migrations/20260904000000_create_profiles_watchlists.sql`.
-4. Run it. Verify there are no errors in the output console.
+   `supabase/migrations/20260904000000_create_profiles_watchlists.sql` and run
+   it — skip this step if it is already applied, because the migration is
+   non-idempotent and will fail loudly on a second run.
+4. In a new query, paste the entire contents of
+   `supabase/migrations/20260904000001_create_portfolios_holdings.sql` and run
+   it. Verify there are no errors in the output console.
 
 ### Option B — Supabase CLI
 
@@ -103,18 +111,31 @@ already exists it fails loudly rather than silently skipping. If you have
 already created these objects by hand, drop them first or start from a fresh
 project.
 
+### Inspecting the applied schema
+
+The SQL Editor runs with an elevated database role that **bypasses Row Level
+Security**, so it can prove structure but never RLS isolation. To inspect
+columns, types, checks, indexes, triggers, policies, and grants, use the
+dashboard's **Table Editor** and **Database → Tables / Database → Policies**
+views, or query `information_schema` / `pg_catalog`. Real ownership isolation
+(user A cannot reach user B's data) is exercised through the API with actual
+user access tokens, not from the SQL Editor.
+
 ## RLS ownership model
 
 Every table below is user-scoped. Row Level Security is enabled on all of them,
-and **no `anon` grants exist** on these tables, so the anon key alone reads and
-writes nothing. All access requires a user access token (see
-[Authenticated endpoint](#authenticated-endpoint)).
+and `anon` has no access to any of them: the `portfolios` and `holdings` tables
+are explicitly revoked from `anon`/`public`, and every table's policies require
+a real `auth.uid()`. The anon key alone reads and writes nothing; all access
+requires a user access token (see [Authenticated endpoints](#authenticated-endpoints)).
 
-| Table                    | Ownership policy                                                                                                                                                                                                                                                   |
-| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `public.profiles`        | One row per `auth.users` id, created automatically by a trigger on registration. Users can `select` / `update` only their own row (policies `auth.uid() = user_id`). No `delete` policy — the row is removed by `ON DELETE CASCADE` when the auth user is deleted. |
-| `public.watchlists`      | Users can `select` / `insert` / `update` / `delete` only their own lists (`auth.uid() = user_id`). Names are case- and whitespace-insensitive unique per user, so `Tech`, `tech`, and `Tech` are the same list.                                                    |
-| `public.watchlist_items` | Ownership is inherited from the parent watchlist via an `EXISTS` subquery (`watchlists.user_id = auth.uid()`). Symbols are stored uppercase/trimmed and unique per watchlist.                                                                                      |
+| Table                    | Ownership policy                                                                                                                                                                                                                                                                                                         |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `public.profiles`        | One row per `auth.users` id, created automatically by a trigger on registration. Users can `select` / `update` only their own row (policies `auth.uid() = user_id`). No `delete` policy — the row is removed by `ON DELETE CASCADE` when the auth user is deleted.                                                       |
+| `public.watchlists`      | Users can `select` / `insert` / `update` / `delete` only their own lists (`auth.uid() = user_id`). Names are case- and whitespace-insensitive unique per user, so `Tech`, `tech`, and `Tech` are the same list.                                                                                                          |
+| `public.watchlist_items` | Ownership is inherited from the parent watchlist via an `EXISTS` subquery (`watchlists.user_id = auth.uid()`). Symbols are stored uppercase/trimmed and unique per watchlist.                                                                                                                                            |
+| `public.portfolios`      | Users can `select` / `insert` / `update` / `delete` only their own portfolios (`auth.uid() = user_id`). Names are case- and whitespace-insensitive unique per user. The `UPDATE … WITH CHECK` prevents reassigning a portfolio to another `user_id`.                                                                     |
+| `public.holdings`        | Ownership is inherited from the parent portfolio via an `EXISTS` subquery (`portfolios.user_id = auth.uid()`). The `UPDATE … WITH CHECK` also prevents moving a holding into another user's portfolio. One row per symbol per portfolio; quantity and average purchase price are exact positive `numeric(18, 6)` values. |
 
 Profile creation trigger: `public.handle_new_user()` fires on `auth.users`
 inserts and copies `raw_user_meta_data ->> 'full_name'` into
@@ -127,6 +148,26 @@ Because requests go through the anon key **plus the user's JWT**, the RLS
 policies keyed on `auth.uid()` are the authorization boundary. The server keeps
 a per-user Supabase client whose `Authorization` header carries the caller's
 access token.
+
+## Portfolio tracking
+
+Users track their own positions by hand. The database stores only what they
+record:
+
+- a portfolio `name`, owned by one user;
+- for each holding inside it, the `symbol`, the `quantity` owned, and the
+  `average_purchase_price` — the average cost **per share**.
+
+Holdings belong to a portfolio, and a portfolio belongs to a user; nothing else
+about a position is persisted.
+
+All current valuations are **USD**; there is no currency conversion yet.
+
+Market prices, cost basis, profit/loss, percentage return, and portfolio totals
+are **calculated values**. They are computed at request time from live market
+data and are **never stored** — the schema has no columns for current price or
+performance. The API endpoints for portfolios and holdings do not exist yet and
+will arrive in a later slice.
 
 ## Authenticated endpoints
 
