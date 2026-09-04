@@ -1,98 +1,152 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# AlphaPulse API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS backend for AlphaPulse — a stock-market signal engine. It authenticates
+users with Supabase Auth, serves market data (quotes/indicators) from Finnhub
+and Twelve Data, and backs user profiles and watchlists with a Supabase
+Postgres database protected by Row Level Security.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+**Status of this slice:** profiles, watchlists, and watchlist items exist in the
+database with full RLS. The NestJS watchlist endpoints come in a later slice —
+for now the API exposes auth and market-data endpoints only.
 
-## Description
+## Architecture
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+- **Runtime** — NestJS 11 with a global `/api` prefix. Interactive Swagger docs
+  at `GET /api/docs`.
+- **Config** — `@nestjs/config` with a startup validator
+  (`src/config/env.validation.ts`): a missing or malformed required variable
+  fails the bootstrap instead of surfacing later as a confusing 500.
+- **Auth** — Supabase Auth (`@supabase/supabase-js`). Register stores the user's
+  full name as `user_metadata.full_name`; a trigger then copies it into
+  `profiles.full_name`. Email confirmation is enabled, so a fresh registration
+  returns a neutral `{ user: null, session: null }` and a login is required to
+  obtain a session.
+- **Database** — Supabase Postgres. User-owned tables are protected by Row
+  Level Security (see [RLS ownership model](#rls-ownership-model)); the API
+  talks to them with the **anon key plus the user's access token** and never
+  uses the secret `service_role` key.
 
-## Project setup
+## Prerequisites
 
-```bash
-$ npm install
-```
+- Node.js 20+ and npm
+- A [Supabase](https://supabase.com) project (free tier is fine) — for auth,
+  Postgres, and RLS
+- API keys for Finnhub and Twelve Data (both have free tiers)
 
-## Compile and run the project
-
-```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
-```
-
-## Run tests
+## Setup
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+npm install
+cp .env.example .env   # then fill in your keys (see below)
 ```
 
-## Deployment
+The app fails fast at startup if required variables are missing or malformed —
+there is no silent misconfiguration.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+### Environment variables
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+| Variable                     | Required | Description                                                                               |
+| ---------------------------- | -------- | ----------------------------------------------------------------------------------------- |
+| `PORT`                       | optional | HTTP port (default 3000)                                                                  |
+| `FINNHUB_API_KEY`            | yes      | Market-data provider key                                                                  |
+| `FINNHUB_BASE_URL`           | optional | Defaults to `https://finnhub.io/api/v1`                                                   |
+| `TWELVE_DATA_API_KEY`        | yes      | Historical-daily-candles provider key                                                     |
+| `TWELVE_DATA_BASE_URL`       | optional | Defaults to `https://api.twelvedata.com`                                                  |
+| `MARKET_PROVIDER_TIMEOUT_MS` | optional | Outbound provider timeout (default 5000)                                                  |
+| `DEFAULT_SYMBOLS`            | optional | Symbols for `GET /api/market/quotes` when none are given                                  |
+| `SUPABASE_URL`               | yes      | Supabase project URL (Project Settings > API)                                             |
+| `SUPABASE_ANON_KEY`          | yes      | Supabase **anon/publishable** key — designed to be public, requests stay sandboxed by RLS |
+
+Never put the secret `service_role` key in `.env` or anywhere client-side. The
+project URL and anon key are not secrets; the values in `.env.example` are
+placeholders — replace them with your own project's values.
+
+## Available commands
+
+| Command             | Description                                         |
+| ------------------- | --------------------------------------------------- |
+| `npm run start`     | Start the server                                    |
+| `npm run start:dev` | Start in watch mode                                 |
+| `npm run build`     | Compile to `dist/`                                  |
+| `npm test`          | Unit tests (Jest)                                   |
+| `npm run test:e2e`  | End-to-end tests (mock Supabase — no live services) |
+| `npm run format`    | Prettier over `src/` and `test/`                    |
+| `npm run lint`      | ESLint with `--fix`                                 |
+
+## Applying the database migration
+
+The schema lives in `supabase/migrations/` as normal SQL. Apply it once against
+your Supabase project.
+
+### Option A — Supabase SQL editor
+
+1. Open your project in the [Supabase dashboard](https://supabase.com/dashboard).
+2. Go to **SQL Editor** and create a new query.
+3. Paste the entire contents of
+   `supabase/migrations/20260904000000_create_profiles_watchlists.sql`.
+4. Run it. Verify there are no errors in the output console.
+
+### Option B — Supabase CLI
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+npx supabase init        # one-time: creates supabase/config.toml
+npx supabase link --project-ref <your-project-ref>
+npx supabase db push
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+`supabase db push` applies any migration files in `supabase/migrations/` that
+your remote database has not seen yet.
 
-## Resources
+The migration is **forward-only and intentionally non-idempotent**: if an object
+already exists it fails loudly rather than silently skipping. If you have
+already created these objects by hand, drop them first or start from a fresh
+project.
 
-Check out a few resources that may come in handy when working with NestJS:
+## RLS ownership model
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+Every table below is user-scoped. Row Level Security is enabled on all of them,
+and **no `anon` grants exist** on these tables, so the anon key alone reads and
+writes nothing. All access requires a user access token (see
+[Authenticated endpoint](#authenticated-endpoint)).
 
-## Support
+| Table                    | Ownership policy                                                                                                                                                                                                                                                   |
+| ------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `public.profiles`        | One row per `auth.users` id, created automatically by a trigger on registration. Users can `select` / `update` only their own row (policies `auth.uid() = user_id`). No `delete` policy — the row is removed by `ON DELETE CASCADE` when the auth user is deleted. |
+| `public.watchlists`      | Users can `select` / `insert` / `update` / `delete` only their own lists (`auth.uid() = user_id`). Names are case- and whitespace-insensitive unique per user, so `Tech`, `tech`, and `Tech` are the same list.                                                    |
+| `public.watchlist_items` | Ownership is inherited from the parent watchlist via an `EXISTS` subquery (`watchlists.user_id = auth.uid()`). Symbols are stored uppercase/trimmed and unique per watchlist.                                                                                      |
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+Profile creation trigger: `public.handle_new_user()` fires on `auth.users`
+inserts and copies `raw_user_meta_data ->> 'full_name'` into
+`profiles.full_name`. Both trigger functions (`handle_new_user`,
+`set_updated_at`) are trigger-only — `EXECUTE` is revoked from `PUBLIC` and
+granted only to the roles that need it, so they cannot be invoked through the
+API.
 
-## Stay in touch
+Because requests go through the anon key **plus the user's JWT**, the RLS
+policies keyed on `auth.uid()` are the authorization boundary. The server keeps
+a per-user Supabase client whose `Authorization` header carries the caller's
+access token.
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+## Authenticated endpoint
 
-## License
+The only endpoint that returns the current user from a bearer token:
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+```
+GET /api/auth/me
+Authorization: Bearer <access_token>
+```
+
+It returns the verified user (`id`, `email`, `emailConfirmed`, `fullName`,
+`createdAt`). `fullName` comes from `user_metadata.full_name` and is `null` for
+accounts created before full names were collected.
+
+Other auth endpoints:
+
+- `POST /api/auth/register` — `{ email, password, fullName }`. With email
+  confirmation enabled, the response is a neutral `{ user: null, session: null }`
+  (treat it as "confirmation email sent"). A `409 Conflict` is returned only
+  when Supabase explicitly reports the email as already registered.
+- `POST /api/auth/login` — `{ email, password }` → user + session.
+
+There is **no logout endpoint**. Clients discard their access and refresh
+tokens locally when done.
