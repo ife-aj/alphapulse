@@ -4,6 +4,7 @@ import { AuthModule } from './auth/auth.module';
 import { HealthModule } from './health/health.module';
 import { MarketModule } from './market/market.module';
 import { SupabaseModule } from './supabase/supabase.module';
+import { WatchlistsModule } from './watchlists/watchlists.module';
 import { validateEnv } from './config/env.validation';
 
 @Module({
@@ -17,6 +18,8 @@ import { validateEnv } from './config/env.validation';
     SupabaseModule,
     // Supabase-backed register/login + guarded /auth/me.
     AuthModule,
+    // Authenticated, RLS-scoped watchlist CRUD.
+    WatchlistsModule,
   ],
 })
 export class AppModule {}

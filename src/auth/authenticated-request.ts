@@ -8,4 +8,10 @@ import type { AuthUserDto } from './dto/auth-response.dto';
  */
 export interface AuthenticatedRequest extends Request {
   user: AuthUserDto;
+  /**
+   * The raw bearer token, attached by SupabaseAuthGuard. Downstream handlers use
+   * it to build a per-user Supabase client (createUserClient) whose requests are
+   * scoped by Row Level Security to this user.
+   */
+  accessToken?: string;
 }

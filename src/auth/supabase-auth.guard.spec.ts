@@ -72,6 +72,15 @@ describe('SupabaseAuthGuard', () => {
     expect(request.user).toEqual(safeUser);
   });
 
+  it('attaches the raw access token for a valid bearer token', async () => {
+    verifyAccessToken.mockResolvedValue(safeUser);
+    const request = makeRequest({ authorization: 'Bearer valid-token' });
+
+    await expect(guard.canActivate(contextFor(request))).resolves.toBe(true);
+
+    expect(request.accessToken).toBe('valid-token');
+  });
+
   it('propagates a 401 when the token is invalid or expired', async () => {
     verifyAccessToken.mockRejectedValue(
       new UnauthorizedException('Invalid or expired access token.'),

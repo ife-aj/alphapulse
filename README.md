@@ -6,8 +6,9 @@ and Twelve Data, and backs user profiles and watchlists with a Supabase
 Postgres database protected by Row Level Security.
 
 **Status of this slice:** profiles, watchlists, and watchlist items exist in the
-database with full RLS. The NestJS watchlist endpoints come in a later slice —
-for now the API exposes auth and market-data endpoints only.
+database with full RLS, and the API exposes authenticated watchlist endpoints
+(create, list, rename, delete, add/remove symbols) alongside auth and
+market-data endpoints.
 
 ## Architecture
 
@@ -127,9 +128,64 @@ policies keyed on `auth.uid()` are the authorization boundary. The server keeps
 a per-user Supabase client whose `Authorization` header carries the caller's
 access token.
 
-## Authenticated endpoint
+## Authenticated endpoints
 
-The only endpoint that returns the current user from a bearer token:
+Every endpoint below requires the same header:
+
+```
+Authorization: Bearer <access_token>
+```
+
+Ownership is always derived from the verified token — the API never accepts a
+`user_id` from request bodies or route parameters — and Row Level Security is
+the final boundary. A resource that does not exist and one that belongs to
+another user are both reported as `404`, so the API reveals nothing about other
+users' data.
+
+### Watchlists
+
+All routes are under the `watchlists` prefix and return camelCase JSON. Names
+are trimmed before storage; symbols are trimmed and uppercased (e.g. `aapl` →
+`AAPL`).
+
+| Method   | Path                                | Body         | Description                                       |
+| -------- | ----------------------------------- | ------------ | ------------------------------------------------- |
+| `POST`   | `/api/watchlists`                   | `{ name }`   | Create a watchlist (`201`)                        |
+| `GET`    | `/api/watchlists`                   | —            | List the user's watchlists with their items       |
+| `PATCH`  | `/api/watchlists/:id`               | `{ name }`   | Rename a watchlist                                |
+| `DELETE` | `/api/watchlists/:id`               | —            | Delete a watchlist and its items (`204`, no body) |
+| `POST`   | `/api/watchlists/:id/items`         | `{ symbol }` | Add a symbol to a watchlist (`201`)               |
+| `DELETE` | `/api/watchlists/:id/items/:symbol` | —            | Remove a symbol from a watchlist (`204`, no body) |
+
+Example — create a watchlist and add a symbol:
+
+```
+POST /api/watchlists
+Authorization: Bearer <access_token>
+
+{ "name": "Tech Stocks" }
+```
+
+```
+POST /api/watchlists/9f1c2c20-1a2b-4c3d-8e4f-5a6b7c8d9e0f/items
+Authorization: Bearer <access_token>
+
+{ "symbol": "aapl" }
+```
+
+Status codes:
+
+- `201` — created (returns the created watchlist / item)
+- `200` — listed or renamed
+- `204` — deleted (no response body)
+- `400` — invalid name, symbol, or `:id` (must be a UUID)
+- `401` — missing/invalid bearer token
+- `404` — watchlist or item not found (or inaccessible)
+- `409` — duplicate watchlist name / duplicate symbol in the same watchlist
+
+### Current user
+
+The endpoint that returns the current user from a bearer token:
 
 ```
 GET /api/auth/me
