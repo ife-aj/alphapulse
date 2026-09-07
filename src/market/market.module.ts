@@ -53,5 +53,8 @@ function providerTimeoutMs(config: ConfigService): number {
         }),
     },
   ],
+  // MarketService is consumed by feature modules (e.g. live portfolio
+  // valuation) so it must be exported; nothing else about MarketModule changes.
+  exports: [MarketService],
 })
 export class MarketModule {}

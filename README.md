@@ -8,11 +8,11 @@ with a Supabase Postgres database protected by Row Level Security.
 **Status of this slice:** profiles, watchlists, and watchlist items exist in the
 database with full RLS, and the API exposes authenticated watchlist endpoints
 (create, list, rename, delete, add/remove symbols) alongside auth and
-market-data endpoints. The `portfolios` and `holdings` tables now exist in the
-database too — positions are recorded manually, and prices and performance are
-computed at request time rather than stored (see
-[Portfolio tracking](#portfolio-tracking)) — but their API endpoints are not
-implemented yet.
+market-data endpoints. The `portfolios` and `holdings` tables are in the database
+too, and their endpoints are now live: portfolio and holding CRUD plus a
+read-only, request-time **valuation** (positions are still recorded manually, and
+prices and performance are computed on demand — see
+[Portfolio tracking](#portfolio-tracking)).
 
 ## Architecture
 
@@ -166,8 +166,38 @@ All current valuations are **USD**; there is no currency conversion yet.
 Market prices, cost basis, profit/loss, percentage return, and portfolio totals
 are **calculated values**. They are computed at request time from live market
 data and are **never stored** — the schema has no columns for current price or
-performance. The API endpoints for portfolios and holdings do not exist yet and
-will arrive in a later slice.
+performance. `GET /api/portfolios/:id/valuation` computes them, read-only: it
+never writes to the database, makes **no** market calls for an empty portfolio,
+and fetches quotes for multiple holdings with bounded concurrency. If any
+holding cannot be valued the whole request fails with `422` (a symbol with no
+market data) or the provider's own error.
+
+### Exact-decimal response contract
+
+Every financial decimal in a portfolio response is a **JSON string**, never a JS
+number, so no value ever round-trips through a binary float on the wire:
+
+- `quantity` and `averagePurchasePrice` echo the stored `numeric(18,6)` cells as
+  **canonical** strings with no trailing zeros (e.g. `"12.5"`, `"152.3755"`).
+- `currentPrice` is the **exact provider price**, echoed back as a canonical
+  string with no trailing zeros and **never rounded** (e.g. `"182.7465"`), so
+  `quantity × currentPrice` reproduces the calculated `currentValue` exactly.
+- Calculated money fields (`investedValue`, `currentValue`, `profitLoss`, and the
+  `total*` aggregates) are rounded to **two decimal places** only when the
+  response is serialized (e.g. `"2284.33"`), from exact decimal arithmetic.
+- `returnPercentage` / `totalReturnPercentage` are percentages rounded to two
+  decimal places (e.g. `"19.93"`).
+- Valuation totals are the exact sum of the exact per-holding values, rounded
+  once — not the sum of the already-rounded rows — so a total may differ from
+  naively adding the rounded rows by a cent; the totals are authoritative.
+
+Request bodies for this slice still send JSON **numbers** for `quantity` and
+`averagePurchasePrice`, within a documented double-safe realistic range (at most
+12 integer digits and 6 decimal places, greater than zero, finite). They are
+validated and canonicalized to exact decimal strings immediately after
+validation and before they are sent to Supabase, so `numeric(18,6)` never
+receives a binary float. `null`, `NaN`, `Infinity`, zero, negatives, over-large
+magnitudes, and more than six decimal places are all rejected with `400`.
 
 ## Authenticated endpoints
 
@@ -223,6 +253,97 @@ Status codes:
 - `401` — missing/invalid bearer token
 - `404` — watchlist or item not found (or inaccessible)
 - `409` — duplicate watchlist name / duplicate symbol in the same watchlist
+
+### Portfolios
+
+All routes are under the `portfolios` prefix and return camelCase JSON. Names
+are trimmed before storage; symbols are trimmed and uppercased. Financial
+decimal fields in every response are strings (see
+[Exact-decimal response contract](#exact-decimal-response-contract)).
+
+| Method   | Path                                 | Body                                                     | Description                                            |
+| -------- | ------------------------------------ | -------------------------------------------------------- | ------------------------------------------------------ |
+| `POST`   | `/api/portfolios`                    | `{ name }`                                               | Create a portfolio (`201`)                             |
+| `GET`    | `/api/portfolios`                    | —                                                        | List the user's portfolios                             |
+| `GET`    | `/api/portfolios/:id`                | —                                                        | Get a portfolio with its holdings                       |
+| `PATCH`  | `/api/portfolios/:id`                | `{ name }`                                               | Rename a portfolio                                     |
+| `DELETE` | `/api/portfolios/:id`                | —                                                        | Delete a portfolio and its holdings (`204`, no body)   |
+| `POST`   | `/api/portfolios/:id/holdings`       | `{ symbol, quantity, averagePurchasePrice }`             | Add a holding (`201`)                                  |
+| `PATCH`  | `/api/portfolios/:id/holdings/:symbol` | `{ quantity?, averagePurchasePrice? }`                 | Update a holding (at least one field required)         |
+| `DELETE` | `/api/portfolios/:id/holdings/:symbol` | —                                                      | Remove a holding (`204`, no body)                      |
+| `GET`    | `/api/portfolios/:id/valuation`      | —                                                        | Live valuation of the portfolio (read-only)            |
+
+Example — create a portfolio, add a holding, and value it:
+
+```
+POST /api/portfolios
+Authorization: Bearer <access_token>
+
+{ "name": "Tech Holdings" }
+```
+
+```
+POST /api/portfolios/9f1c2c20-1a2b-4c3d-8e4f-5a6b7c8d9e0f/holdings
+Authorization: Bearer <access_token>
+
+{ "symbol": "aapl", "quantity": 12.5, "averagePurchasePrice": 152.3755 }
+```
+
+```
+GET /api/portfolios/9f1c2c20-1a2b-4c3d-8e4f-5a6b7c8d9e0f/valuation
+Authorization: Bearer <access_token>
+```
+
+A valuation response looks like:
+
+```json
+{
+  "portfolioId": "9f1c2c20-1a2b-4c3d-8e4f-5a6b7c8d9e0f",
+  "totalInvestedValue": "1904.69",
+  "totalCurrentValue": "2284.33",
+  "totalProfitLoss": "379.64",
+  "totalReturnPercentage": "19.93",
+  "holdings": [
+    {
+      "symbol": "AAPL",
+      "quantity": "12.5",
+      "averagePurchasePrice": "152.3755",
+      "currentPrice": "182.7465",
+      "investedValue": "1904.69",
+      "currentValue": "2284.33",
+      "profitLoss": "379.64",
+      "returnPercentage": "19.93"
+    }
+  ]
+}
+```
+
+Note the two forms: `currentPrice` is the exact provider value (`"182.7465"`, not
+rounded to cents) — `12.5 × 182.7465 = "2284.33"` — while `currentValue`,
+`investedValue`, `profitLoss`, and the totals are calculated outputs rounded to
+two decimal places.
+
+Status codes:
+
+- `201` — created (returns the created portfolio / holding)
+- `200` — listed, fetched, renamed, updated, or valued
+- `204` — deleted (no response body)
+- `400` — invalid name, symbol, `quantity`/`averagePurchasePrice`, empty holding
+  patch body, or malformed `:id` (must be a UUID)
+- `401` — missing/invalid bearer token
+- `404` — portfolio or holding not found (or inaccessible)
+- `409` — duplicate portfolio name / duplicate symbol in the same portfolio
+- `422` — a held symbol has no market data, so the portfolio cannot be valued
+
+> **Verifying RLS ownership.** The automated e2e tests mock Supabase, so their
+> `404`s verify only the API's *neutral* contract, not live isolation. To verify
+> ownership end to end, register two real users. With user B's token, create a
+> portfolio and add a holding to it. Then, with user A's token, confirm that A
+> cannot reach B's data — `GET /api/portfolios/:id` (which returns the
+> portfolio's holdings), `PATCH`/`DELETE /api/portfolios/:id`, the holding
+> routes, and `GET /api/portfolios/:id/valuation` must each return `404`,
+> identical to a missing resource — and that `GET /api/portfolios` never
+> includes B's rows.
 
 ### Current user
 

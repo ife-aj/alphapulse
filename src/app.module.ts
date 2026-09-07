@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 import { AuthModule } from './auth/auth.module';
 import { HealthModule } from './health/health.module';
 import { MarketModule } from './market/market.module';
+import { PortfoliosModule } from './portfolios/portfolios.module';
 import { SupabaseModule } from './supabase/supabase.module';
 import { WatchlistsModule } from './watchlists/watchlists.module';
 import { validateEnv } from './config/env.validation';
@@ -20,6 +21,8 @@ import { validateEnv } from './config/env.validation';
     AuthModule,
     // Authenticated, RLS-scoped watchlist CRUD.
     WatchlistsModule,
+    // Authenticated portfolio CRUD, holdings, and live valuation.
+    PortfoliosModule,
   ],
 })
 export class AppModule {}
