@@ -1,11 +1,17 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { IoAdapter } from '@nestjs/platform-socket.io';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+
+  // Bind the Socket.IO gateway to the same HTTP server and port as the REST
+  // API. No CORS is enabled anywhere, consistent with the HTTP policy below:
+  // the socket only serves same-origin / non-browser clients.
+  app.useWebSocketAdapter(new IoAdapter(app));
 
   // Every route lives under /api (e.g. GET /api/health).
   app.setGlobalPrefix('api');

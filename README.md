@@ -12,7 +12,9 @@ market-data endpoints. The `portfolios` and `holdings` tables are in the databas
 too, and their endpoints are now live: portfolio and holding CRUD plus a
 read-only, request-time **valuation** (positions are still recorded manually, and
 prices and performance are computed on demand — see
-[Portfolio tracking](#portfolio-tracking)).
+[Portfolio tracking](#portfolio-tracking)). An authenticated Socket.IO gateway
+delivers that same valuation live per subscription — see
+[Live portfolio valuation](#live-portfolio-valuation-socketio).
 
 ## Architecture
 
@@ -199,6 +201,95 @@ validation and before they are sent to Supabase, so `numeric(18,6)` never
 receives a binary float. `null`, `NaN`, `Infinity`, zero, negatives, over-large
 magnitudes, and more than six decimal places are all rejected with `400`.
 
+## Live portfolio valuation (Socket.IO)
+
+An authenticated Socket.IO gateway (`RealtimeModule`) runs on the same HTTP
+server and port as the REST API. In this slice it serves one thing: when a
+socket subscribes to a portfolio it owns, the server values it through the exact
+same read-only path as `GET /api/portfolios/:id/valuation` and pushes **one**
+`portfolio:valuation` event to that socket. There is no recurring polling yet —
+later slices will add live updates on a schedule.
+
+### Connecting and authenticating
+
+Connect to the root namespace and pass the Supabase access token in the
+handshake `auth` object. Do **not** send the token as an emitted payload.
+
+```js
+import { io } from 'socket.io-client';
+
+const socket = io('https://your-api.example.com', {
+  auth: { token: '<access_token>' }, // verified by AuthService before connecting
+  transports: ['websocket'],
+});
+```
+
+A missing or invalid token rejects the connection _before_ it is established:
+the client receives `connect_error` with a neutral message and a single error
+code, and the database is never touched.
+
+```json
+{ "message": "Authentication failed.", "data": { "code": "UNAUTHORIZED" } }
+```
+
+### Events
+
+| Direction       | Event                   | Payload                                 | Reply (ack)                 |
+| --------------- | ----------------------- | --------------------------------------- | --------------------------- |
+| client → server | `portfolio:subscribe`   | `{ portfolioId: "<uuid>" }`             | see below                   |
+| client → server | `portfolio:unsubscribe` | `{ portfolioId: "<uuid>" }`             | `{ ok: true, portfolioId }` |
+| server → client | `portfolio:valuation`   | `{ portfolioId, emittedAt, valuation }` | —                           |
+| server → client | `portfolio:error`       | `{ code, message }`                     | —                           |
+
+Subscribe, then wait for the initial valuation:
+
+```js
+socket.emit('portfolio:subscribe', { portfolioId }, (ack) => {
+  console.log(ack); // { ok: true, portfolioId, subscribed: true }
+});
+
+socket.on('portfolio:valuation', ({ portfolioId, emittedAt, valuation }) => {
+  console.log(valuation); // identical to the REST valuation response
+});
+```
+
+`ack` shapes for `portfolio:subscribe`:
+
+- `{ ok: true, portfolioId, subscribed: true }` — newly subscribed; a
+  `portfolio:valuation` follows.
+- `{ ok: true, portfolioId, subscribed: false }` — already subscribed (idempotent
+  duplicate); no second valuation is sent.
+- `{ ok: false, error: { code, message } }` — see error codes below.
+
+Both `portfolio:subscribe` and `portfolio:unsubscribe` are idempotent.
+Unsubscribing from a portfolio the socket was never subscribed to still
+acknowledges `{ ok: true, portfolioId }` and reveals nothing. Disconnecting a
+socket automatically removes all of its subscriptions and room memberships.
+
+### Error codes
+
+Errors are returned on the subscribe/unsubscribe **acknowledgement** (or as a
+`connect_error` for `UNAUTHORIZED`), never on `portfolio:error` — which is a
+typed, post-connection error channel reserved for server-pushed problems.
+Messages are neutral and never expose Supabase, Finnhub, or provider internals.
+
+| Code                  | Meaning                                                                          |
+| --------------------- | -------------------------------------------------------------------------------- |
+| `UNAUTHORIZED`        | Connection refused during the handshake (missing/invalid token).                 |
+| `VALIDATION_ERROR`    | `portfolioId` is missing or not a UUID.                                          |
+| `PORTFOLIO_NOT_FOUND` | The portfolio does not exist or belongs to another user (identical, so no leak). |
+| `MARKET_UNAVAILABLE`  | The initial valuation failed on the market/provider side — retry later.          |
+| `INTERNAL_ERROR`      | An unexpected server error.                                                      |
+
+The `valuation` payload is the exact `PortfolioValuationDto` from the REST
+contract — every financial decimal is a string and the figures match
+`GET /api/portfolios/:id/valuation` byte-for-byte (see
+[Exact-decimal response contract](#exact-decimal-response-contract)). No user id
+is ever accepted from a payload: ownership is always derived from the verified
+token, and each subscription is authorized through the same ownership check as
+the REST route. Like the HTTP API, the gateway enables **no CORS** — the socket
+serves same-origin and non-browser clients only.
+
 ## Authenticated endpoints
 
 Every endpoint below requires the same header:
@@ -261,17 +352,17 @@ are trimmed before storage; symbols are trimmed and uppercased. Financial
 decimal fields in every response are strings (see
 [Exact-decimal response contract](#exact-decimal-response-contract)).
 
-| Method   | Path                                 | Body                                                     | Description                                            |
-| -------- | ------------------------------------ | -------------------------------------------------------- | ------------------------------------------------------ |
-| `POST`   | `/api/portfolios`                    | `{ name }`                                               | Create a portfolio (`201`)                             |
-| `GET`    | `/api/portfolios`                    | —                                                        | List the user's portfolios                             |
-| `GET`    | `/api/portfolios/:id`                | —                                                        | Get a portfolio with its holdings                       |
-| `PATCH`  | `/api/portfolios/:id`                | `{ name }`                                               | Rename a portfolio                                     |
-| `DELETE` | `/api/portfolios/:id`                | —                                                        | Delete a portfolio and its holdings (`204`, no body)   |
-| `POST`   | `/api/portfolios/:id/holdings`       | `{ symbol, quantity, averagePurchasePrice }`             | Add a holding (`201`)                                  |
-| `PATCH`  | `/api/portfolios/:id/holdings/:symbol` | `{ quantity?, averagePurchasePrice? }`                 | Update a holding (at least one field required)         |
-| `DELETE` | `/api/portfolios/:id/holdings/:symbol` | —                                                      | Remove a holding (`204`, no body)                      |
-| `GET`    | `/api/portfolios/:id/valuation`      | —                                                        | Live valuation of the portfolio (read-only)            |
+| Method   | Path                                   | Body                                         | Description                                          |
+| -------- | -------------------------------------- | -------------------------------------------- | ---------------------------------------------------- |
+| `POST`   | `/api/portfolios`                      | `{ name }`                                   | Create a portfolio (`201`)                           |
+| `GET`    | `/api/portfolios`                      | —                                            | List the user's portfolios                           |
+| `GET`    | `/api/portfolios/:id`                  | —                                            | Get a portfolio with its holdings                    |
+| `PATCH`  | `/api/portfolios/:id`                  | `{ name }`                                   | Rename a portfolio                                   |
+| `DELETE` | `/api/portfolios/:id`                  | —                                            | Delete a portfolio and its holdings (`204`, no body) |
+| `POST`   | `/api/portfolios/:id/holdings`         | `{ symbol, quantity, averagePurchasePrice }` | Add a holding (`201`)                                |
+| `PATCH`  | `/api/portfolios/:id/holdings/:symbol` | `{ quantity?, averagePurchasePrice? }`       | Update a holding (at least one field required)       |
+| `DELETE` | `/api/portfolios/:id/holdings/:symbol` | —                                            | Remove a holding (`204`, no body)                    |
+| `GET`    | `/api/portfolios/:id/valuation`        | —                                            | Live valuation of the portfolio (read-only)          |
 
 Example — create a portfolio, add a holding, and value it:
 
@@ -336,7 +427,7 @@ Status codes:
 - `422` — a held symbol has no market data, so the portfolio cannot be valued
 
 > **Verifying RLS ownership.** The automated e2e tests mock Supabase, so their
-> `404`s verify only the API's *neutral* contract, not live isolation. To verify
+> `404`s verify only the API's _neutral_ contract, not live isolation. To verify
 > ownership end to end, register two real users. With user B's token, create a
 > portfolio and add a holding to it. Then, with user A's token, confirm that A
 > cannot reach B's data — `GET /api/portfolios/:id` (which returns the

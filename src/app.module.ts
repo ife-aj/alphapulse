@@ -4,6 +4,7 @@ import { AuthModule } from './auth/auth.module';
 import { HealthModule } from './health/health.module';
 import { MarketModule } from './market/market.module';
 import { PortfoliosModule } from './portfolios/portfolios.module';
+import { RealtimeModule } from './realtime/realtime.module';
 import { SupabaseModule } from './supabase/supabase.module';
 import { WatchlistsModule } from './watchlists/watchlists.module';
 import { validateEnv } from './config/env.validation';
@@ -23,6 +24,8 @@ import { validateEnv } from './config/env.validation';
     WatchlistsModule,
     // Authenticated portfolio CRUD, holdings, and live valuation.
     PortfoliosModule,
+    // Authenticated Socket.IO gateway: one initial valuation per subscribe.
+    RealtimeModule,
   ],
 })
 export class AppModule {}

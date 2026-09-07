@@ -16,5 +16,8 @@ import { PortfoliosService } from './portfolios.service';
   imports: [SupabaseModule, AuthModule, MarketModule],
   controllers: [PortfoliosController],
   providers: [PortfoliosService, PortfoliosValuationService],
+  // RealtimeModule reuses getValuation (authorization + exact-decimal
+  // valuation) for the authenticated live socket.
+  exports: [PortfoliosValuationService],
 })
 export class PortfoliosModule {}
