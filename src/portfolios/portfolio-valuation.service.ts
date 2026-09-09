@@ -9,16 +9,12 @@ import { MarketService } from '../market/market.service';
 import { SupabaseService } from '../supabase/supabase.service';
 import { mapWithConcurrency, VALUATION_QUOTE_CONCURRENCY } from './concurrency';
 import { toDatabaseHttpException } from './database-errors';
+import { toDecimal } from './decimal';
+import { PortfolioValuationDto } from './dto/valuation-response.dto';
 import {
-  moneyString,
-  percentString,
-  toCanonicalDecimalString,
-  toDecimal,
-} from './decimal';
-import {
-  HoldingValuationDto,
-  PortfolioValuationDto,
-} from './dto/valuation-response.dto';
+  computePortfolioValuation,
+  ValuationHolding,
+} from './valuation-computation';
 
 const PORTFOLIO_NOT_FOUND = 'Portfolio not found.';
 const NO_MARKET_DATA =
@@ -36,14 +32,23 @@ interface ValuationHoldingRow {
 /**
  * Live portfolio valuation — read-only.
  *
- * Loads one portfolio and its holdings under RLS, fetches a live quote for every
- * held symbol with bounded concurrency (never `Promise.all` over an unbounded
- * list), and computes exact fixed-point values with decimal.js. All financial
- * decimals in the response are JSON strings; rounding happens only when those
- * strings are built — and only for calculated money/percentage figures.
- * `currentPrice` is the exact provider price echoed back canonically, never
- * rounded, so it always agrees with the `currentValue` that was calculated
- * from it.
+ * The flow is split into three independently reusable phases:
+ *
+ *  1. `getValuationHoldings` — authorize the request and load one portfolio's
+ *     holdings under RLS as normalized domain values.
+ *  2. `valueHoldings` — fetch and validate a live quote for every held symbol
+ *     with bounded concurrency (never `Promise.all` over an unbounded list).
+ *  3. `computePortfolioValuation` (pure, in `./valuation-computation`) — exact
+ *     fixed-point arithmetic over Decimals; rounding happens only when response
+ *     strings are built, and only for calculated money/percentage figures.
+ *
+ * `getValuation` orchestrates the first two and is the single entry point the
+ * REST controller and the realtime gateway both call, unchanged. The third
+ * phase is the seam a future realtime poller reuses when it already has prices.
+ *
+ * All financial decimals in the response are JSON strings; `currentPrice` is the
+ * exact provider price echoed back canonically, never rounded, so it always
+ * agrees with the `currentValue` that was calculated from it.
  *
  * Contracts:
  *  - An empty portfolio returns zero totals and makes NO market calls.
@@ -61,11 +66,40 @@ export class PortfoliosValuationService {
     private readonly marketService: MarketService,
   ) {}
 
+  /**
+   * Authorize + load the holdings, then price and value them. Externally
+   * unchanged: the REST controller and the realtime gateway call this and
+   * receive the same DTO and errors as before.
+   */
   async getValuation(
     userId: string,
     accessToken: string,
     portfolioId: string,
   ): Promise<PortfolioValuationDto> {
+    const holdings = await this.getValuationHoldings(
+      userId,
+      accessToken,
+      portfolioId,
+    );
+    return this.valueHoldings(portfolioId, holdings);
+  }
+
+  /**
+   * Authorize the request against the verified user and load that portfolio's
+   * holdings as normalized domain values.
+   *
+   * Ownership is scoped to `userId` (derived from the verified token, never from
+   * any client-controlled data) and a missing portfolio and another user's
+   * portfolio collapse to the same neutral 404. Holdings use the same narrow
+   * select as the REST valuation (never ids/timestamps) and stay ordered by
+   * symbol. Numeric cells are normalized into exact Decimals here — raw
+   * Supabase/PostgREST rows never leave the portfolios module.
+   */
+  async getValuationHoldings(
+    userId: string,
+    accessToken: string,
+    portfolioId: string,
+  ): Promise<ValuationHolding[]> {
     const client = this.supabase.createUserClient(accessToken);
     try {
       const { data: portfolio, error: portfolioError } = await client
@@ -85,87 +119,58 @@ export class PortfoliosValuationService {
         .order('symbol');
       if (error) throw toDatabaseHttpException(error, 'list-holdings');
 
-      const rows = ((data ?? []) as ValuationHoldingRow[]).map((row) => ({
+      return ((data ?? []) as ValuationHoldingRow[]).map((row) => ({
         symbol: row.symbol,
         quantity: toDecimal(row.quantity),
         averagePurchasePrice: toDecimal(row.average_purchase_price),
-        quantityText: toCanonicalDecimalString(row.quantity),
-        averagePurchasePriceText: toCanonicalDecimalString(
-          row.average_purchase_price,
-        ),
       }));
-
-      if (rows.length === 0) {
-        return this.emptyValuation(portfolioId);
-      }
-
-      // Bounded-concurrency quote fetch. Order is preserved, so prices line up
-      // with `rows` by index.
-      const prices = await mapWithConcurrency(
-        rows.map((row) => row.symbol),
-        VALUATION_QUOTE_CONCURRENCY,
-        (symbol) => this.fetchCurrentPrice(symbol),
-      );
-
-      const holdings: HoldingValuationDto[] = [];
-      let totalInvestedExact = new Decimal(0);
-      let totalCurrentExact = new Decimal(0);
-
-      for (let i = 0; i < rows.length; i += 1) {
-        const row = rows[i];
-        const investedExact = row.quantity.mul(row.averagePurchasePrice);
-        const currentValueExact = row.quantity.mul(prices[i]);
-        const profitLossExact = currentValueExact.sub(investedExact);
-
-        totalInvestedExact = totalInvestedExact.plus(investedExact);
-        totalCurrentExact = totalCurrentExact.plus(currentValueExact);
-
-        holdings.push({
-          symbol: row.symbol,
-          quantity: row.quantityText,
-          averagePurchasePrice: row.averagePurchasePriceText,
-          // The exact provider price, serialized canonically (never rounded):
-          // multiplying this displayed value by the quantity reproduces the
-          // currentValue exactly, which would break if the price were rounded
-          // to cents first (e.g. 12.5 × 182.7465 = "2284.33", not "2284.38").
-          currentPrice: prices[i].toString(),
-          investedValue: moneyString(investedExact),
-          currentValue: moneyString(currentValueExact),
-          profitLoss: moneyString(profitLossExact),
-          returnPercentage: percentString(profitLossExact, investedExact),
-        });
-      }
-
-      const totalProfitLossExact = totalCurrentExact.sub(totalInvestedExact);
-
-      return {
-        portfolioId,
-        // Totals are the exact sums of the exact per-holding values, rounded
-        // once here — never the sum of the rounded per-holding strings.
-        totalInvestedValue: moneyString(totalInvestedExact),
-        totalCurrentValue: moneyString(totalCurrentExact),
-        totalProfitLoss: moneyString(totalProfitLossExact),
-        totalReturnPercentage: percentString(
-          totalProfitLossExact,
-          totalInvestedExact,
-        ),
-        holdings,
-      };
     } catch (error) {
       if (error instanceof HttpException) throw error;
       throw toDatabaseHttpException(error, 'list-holdings');
     }
   }
 
-  private emptyValuation(portfolioId: string): PortfolioValuationDto {
-    return {
-      portfolioId,
-      totalInvestedValue: moneyString(new Decimal(0)),
-      totalCurrentValue: moneyString(new Decimal(0)),
-      totalProfitLoss: moneyString(new Decimal(0)),
-      totalReturnPercentage: moneyString(new Decimal(0)),
-      holdings: [],
-    };
+  /**
+   * Price already-loaded holdings and compute their valuation. This is the
+   * shared phase a future realtime poller can call with prices it already has.
+   *
+   * An empty holding set returns the exact zero valuation and makes NO market
+   * calls. Otherwise every held symbol is fetched through the bounded-concurrency
+   * worker pool — one provider call per holding in input order — and the whole
+   * request is all-or-nothing: if any holding cannot be valued the computation
+   * is discarded and the error thrown. Provider behaviour is unchanged:
+   * unknown-symbol 404 → 422, non-positive/non-finite price → 422, transport and
+   * rate-limit failures pass through. Validated prices are paired back onto
+   * their holdings by position and handed to the pure `computePortfolioValuation`.
+   */
+  async valueHoldings(
+    portfolioId: string,
+    holdings: readonly ValuationHolding[],
+  ): Promise<PortfolioValuationDto> {
+    try {
+      if (holdings.length === 0) {
+        return computePortfolioValuation(portfolioId, []);
+      }
+
+      // Bounded-concurrency quote fetch. Order is preserved, so prices line up
+      // with `holdings` by index.
+      const prices = await mapWithConcurrency(
+        holdings.map((holding) => holding.symbol),
+        VALUATION_QUOTE_CONCURRENCY,
+        (symbol) => this.fetchCurrentPrice(symbol),
+      );
+
+      return computePortfolioValuation(
+        portfolioId,
+        holdings.map((holding, index) => ({
+          ...holding,
+          currentPrice: prices[index],
+        })),
+      );
+    } catch (error) {
+      if (error instanceof HttpException) throw error;
+      throw toDatabaseHttpException(error, 'list-holdings');
+    }
   }
 
   /**
