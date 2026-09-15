@@ -16,8 +16,9 @@ import {
 } from '@nestjs/websockets';
 import type { Server, Socket } from 'socket.io';
 import { AuthService } from '../auth/auth.service';
-import { PortfoliosValuationService } from '../portfolios/portfolio-valuation.service';
 import { SubscribePortfolioDto } from './dto/subscribe-portfolio.dto';
+import { RealtimeSubscriptionService } from './realtime-subscription.service';
+import type { RealtimeSubscribeResult } from './realtime-subscription.service';
 import {
   PORTFOLIO_SUBSCRIBE_EVENT,
   PORTFOLIO_UNSUBSCRIBE_EVENT,
@@ -50,11 +51,21 @@ const VALIDATION_MESSAGE = 'portfolioId must be a valid UUID.';
  * reaches the connected state, so no `@SubscribeMessage` handler can ever run
  * for an unauthenticated socket.
  *
- * This slice delivers exactly one initial `portfolio:valuation` per successful
- * subscription. There is no polling, quote cache, symbol reference counting, or
- * stale-price reuse yet; subscriptions are re-valued by reusing the existing
- * `PortfoliosValuationService.getValuation(...)`, which is also the ownership
- * boundary (neutral 404 for missing/foreign portfolios).
+ * The gateway owns the transport — handshake authentication, payload
+ * validation, joining/leaving rooms, the one initial `portfolio:valuation` per
+ * successful subscription, acknowledgements, and neutral error mapping. Every
+ * subscription state change is delegated to `RealtimeSubscriptionService`, the
+ * authoritative registry (socket → user + subscriptions, active portfolios and
+ * their symbol snapshots, symbols → portfolios). `socket.data` no longer owns
+ * subscription state — it carries only the verified identity and the transient
+ * access token.
+ *
+ * This slice delivers exactly one initial valuation per successful subscribe.
+ * There is no polling, quote cache, symbol-reference-driven pricing, or
+ * stale-price reuse yet; each fresh subscription is authorized and valued by
+ * reusing `PortfoliosValuationService` (neutral 404 for missing/foreign
+ * portfolios), and two sockets on the same portfolio each receive their own
+ * initial valuation.
  *
  * No CORS is configured here, consistent with the HTTP API, which enables no
  * CORS either (see `src/main.ts`). Cross-origin browser clients are out of
@@ -66,7 +77,7 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   constructor(
     private readonly authService: AuthService,
-    private readonly valuationService: PortfoliosValuationService,
+    private readonly subscriptionService: RealtimeSubscriptionService,
   ) {}
 
   /**
@@ -106,13 +117,14 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
   }
 
   /**
-   * On disconnect there is nothing to clean up globally: subscriptions live on
-   * `socket.data.portfolioIds` (garbage-collected with the socket) and Socket.IO
-   * automatically removes a socket from every room it joined. Clearing the set
-   * here is purely defensive.
+   * On disconnect the registry cancels every pending attempt and removes every
+   * active subscription belonging to this socket (last-socket portfolios and
+   * their symbol references are cleaned up). Socket.IO independently removes
+   * the socket from every room it joined. Idempotent and safe for sockets that
+   * never authenticated.
    */
   handleDisconnect(socket: PortfolioSocket): void {
-    socket.data?.portfolioIds?.clear();
+    this.subscriptionService.disconnect(socket.id);
   }
 
   @SubscribeMessage(PORTFOLIO_SUBSCRIBE_EVENT)
@@ -125,55 +137,95 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
       return this.errorAck('VALIDATION_ERROR', VALIDATION_MESSAGE);
     }
 
-    const { userId, accessToken, portfolioIds } = socket.data;
+    const { userId, accessToken } = socket.data;
+    const room = portfolioRoom(userId, portfolioId);
 
-    // Idempotent duplicate: the portfolio is already reserved/subscribed on this
-    // socket. Acknowledge success with subscribed:false and do not re-validate,
-    // re-join, or value it again.
-    if (portfolioIds.has(portfolioId)) {
-      return { ok: true, portfolioId, subscribed: false };
-    }
-
-    // Reserve the subscription *before* the first await. Reserving up front
-    // closes the race where two pipelined subscribe packets for the same
-    // portfolio on this socket could both observe an empty set and both call
-    // the valuation service. The reservation is released on failure below, so a
-    // later legitimate retry can subscribe.
-    portfolioIds.add(portfolioId);
-
+    // The registry authorizes, values, and activates the subscription. A socket
+    // that is already pending/active gets a duplicate ack with no second
+    // authorization, valuation, or provider call. An authorization/valuation
+    // failure is rolled back inside the registry (only the matching attempt)
+    // and rethrown here for the existing neutral error mapping.
+    let result: RealtimeSubscribeResult;
     try {
-      // Authorization + initial valuation in one call: getValuation verifies the
-      // portfolio belongs to this user (neutral 404 otherwise) and computes the
-      // exact-decimal valuation, reusing the REST path unchanged. It never runs
-      // before the reservation is taken.
-      const valuation = await this.valuationService.getValuation(
+      result = await this.subscriptionService.subscribe({
+        socketId: socket.id,
         userId,
         accessToken,
         portfolioId,
-      );
+      });
+    } catch (error) {
+      socket.leave(room); // defensive no-op: the room was never joined
+      const mapped = this.mapValuationError(error);
+      this.logSubscribeFailure(error, mapped, userId, portfolioId);
+      return { ok: false, error: mapped };
+    }
 
-      // Authorization succeeded — only now join the private, server-generated
-      // room for (user, portfolio) and push the one initial valuation to the
-      // subscribing socket only.
-      socket.join(portfolioRoom(userId, portfolioId));
+    // Duplicate, or the attempt was cancelled while authorization/valuation was
+    // unresolved (unsubscribe/disconnect/newer retry): acknowledge as not newly
+    // subscribed, join nothing, emit nothing.
+    if (result.kind !== 'subscribed') {
+      return { ok: true, portfolioId, subscribed: false };
+    }
+
+    // The registry committed this exact attempt as active. Confirm it is still
+    // the live subscription before any transport work.
+    if (
+      !this.subscriptionService.confirmActive(
+        socket.id,
+        userId,
+        portfolioId,
+        result.attemptId,
+      )
+    ) {
+      return { ok: true, portfolioId, subscribed: false };
+    }
+
+    try {
+      // Join the private, server-generated room for (user, portfolio) and push
+      // the one initial valuation to the subscribing socket only. There is no
+      // await between activation and emission, so a disconnect/unsubscribe
+      // cannot interleave; the second confirm before emitting is defensive. The
+      // bundled in-memory Socket.IO adapter joins/leaves rooms synchronously,
+      // which is what makes this non-awaited window safe for this single-instance
+      // slice; a multi-instance adapter would need it revisited.
+      socket.join(room);
+      if (
+        !this.subscriptionService.confirmActive(
+          socket.id,
+          userId,
+          portfolioId,
+          result.attemptId,
+        )
+      ) {
+        socket.leave(room);
+        return { ok: true, portfolioId, subscribed: false };
+      }
 
       const event: PortfolioValuationEvent = {
         portfolioId,
         emittedAt: new Date().toISOString(),
-        valuation,
+        valuation: result.valuation,
       };
       socket.emit(PORTFOLIO_VALUATION_EVENT, event);
       this.logger.debug(
         `Subscribed socket ${socket.id} to portfolio ${portfolioId} for user ${userId}`,
       );
-
       return { ok: true, portfolioId, subscribed: true };
     } catch (error) {
-      // Valuation/authorization/join failed: release the reservation so a later
-      // retry can subscribe, and leave the room defensively (a Socket.IO no-op
-      // if the join never happened).
-      portfolioIds.delete(portfolioId);
-      socket.leave(portfolioRoom(userId, portfolioId));
+      // Room/transport failure after activation: roll back only this exact
+      // subscription attempt (never a newer replacement), leave the room
+      // defensively, and surface the existing neutral error contract.
+      this.subscriptionService.rollbackSubscription(
+        socket.id,
+        userId,
+        portfolioId,
+        result.attemptId,
+      );
+      try {
+        socket.leave(room);
+      } catch {
+        // Already unwinding.
+      }
       const mapped = this.mapValuationError(error);
       this.logSubscribeFailure(error, mapped, userId, portfolioId);
       return { ok: false, error: mapped };
@@ -190,11 +242,11 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
       return this.errorAck('VALIDATION_ERROR', VALIDATION_MESSAGE);
     }
 
-    const { userId, portfolioIds } = socket.data;
-    // Idempotent: removing a portfolio that was not subscribed is a success and
-    // reveals nothing about whether it was tracked. Leaving a room the socket is
-    // not in is a Socket.IO no-op.
-    portfolioIds.delete(portfolioId);
+    const { userId } = socket.data;
+    // Idempotent: the registry removes the pending/active subscription if
+    // present and reveals nothing about whether it was tracked. Leaving a room
+    // the socket is not in is a Socket.IO no-op.
+    this.subscriptionService.unsubscribe(socket.id, userId, portfolioId);
     socket.leave(portfolioRoom(userId, portfolioId));
     return { ok: true, portfolioId };
   }
@@ -211,7 +263,6 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
     const authenticated = socket as unknown as PortfolioSocket;
     authenticated.data.userId = user.id;
     authenticated.data.accessToken = token;
-    authenticated.data.portfolioIds = new Set<string>();
   }
 
   private extractToken(socket: Socket): string | null {

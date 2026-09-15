@@ -8,8 +8,8 @@ import type { Server } from 'socket.io';
 import { AuthService } from '../auth/auth.service';
 import type { AuthUserDto } from '../auth/dto/auth-response.dto';
 import type { PortfolioValuationDto } from '../portfolios/dto/valuation-response.dto';
-import { PortfoliosValuationService } from '../portfolios/portfolio-valuation.service';
 import { PortfolioGateway } from './portfolio.gateway';
+import { RealtimeSubscriptionService } from './realtime-subscription.service';
 import {
   PORTFOLIO_SUBSCRIBE_EVENT,
   PORTFOLIO_VALUATION_EVENT,
@@ -18,13 +18,20 @@ import {
 } from './realtime.types';
 
 describe('PortfolioGateway', () => {
+  const SOCKET_ID = 'socket-1';
   const USER_ID = 'user-1';
   const ACCESS_TOKEN = 'access-token-1';
   const PORTFOLIO_ID = '3a6a2f6e-8f38-4b0b-9a66-1f6a2c7c1a6f';
 
   let gateway: PortfolioGateway;
   let authService: { verifyAccessToken: jest.Mock };
-  let valuationService: { getValuation: jest.Mock };
+  let subscriptionService: {
+    subscribe: jest.Mock;
+    unsubscribe: jest.Mock;
+    disconnect: jest.Mock;
+    confirmActive: jest.Mock;
+    rollbackSubscription: jest.Mock;
+  };
 
   const user: AuthUserDto = {
     id: USER_ID,
@@ -43,6 +50,13 @@ describe('PortfolioGateway', () => {
     holdings: [],
   };
 
+  /** The registry's prepared active result for a successful new subscription. */
+  const subscribedResult = {
+    kind: 'subscribed',
+    attemptId: 1,
+    valuation,
+  };
+
   /** A fake socket carrying only what the gateway touches. */
   function makeSocket(overrides: Partial<PortfolioSocket['data']> = {}): {
     socket: PortfolioSocket;
@@ -54,10 +68,10 @@ describe('PortfolioGateway', () => {
     const join = jest.fn();
     const leave = jest.fn();
     const socket = {
+      id: SOCKET_ID,
       data: {
         userId: USER_ID,
         accessToken: ACCESS_TOKEN,
-        portfolioIds: new Set<string>(),
         ...overrides,
       },
       emit,
@@ -69,10 +83,16 @@ describe('PortfolioGateway', () => {
 
   beforeEach(() => {
     authService = { verifyAccessToken: jest.fn() };
-    valuationService = { getValuation: jest.fn() };
+    subscriptionService = {
+      subscribe: jest.fn(),
+      unsubscribe: jest.fn(),
+      disconnect: jest.fn(),
+      confirmActive: jest.fn().mockReturnValue(true),
+      rollbackSubscription: jest.fn(),
+    };
     gateway = new PortfolioGateway(
       authService as unknown as AuthService,
-      valuationService as unknown as PortfoliosValuationService,
+      subscriptionService as unknown as RealtimeSubscriptionService,
     );
   });
 
@@ -121,10 +141,11 @@ describe('PortfolioGateway', () => {
       expect(error.data).toEqual({ code: 'UNAUTHORIZED' });
     });
 
-    it('accepts a valid token and stores the verified identity on socket.data', async () => {
+    it('accepts a valid token and stores only the verified identity on socket.data', async () => {
       authService.verifyAccessToken.mockResolvedValue(user);
       // Socket.IO initialises every socket with `data: {}`; the middleware
-      // writes the verified identity onto it.
+      // writes the verified identity onto it. No subscription bookkeeping is
+      // attached here — the registry owns that state now.
       const socket: { data: PortfolioSocket['data']; handshake: object } = {
         data: {},
         handshake: handshake(ACCESS_TOKEN),
@@ -136,7 +157,6 @@ describe('PortfolioGateway', () => {
       expect(socket.data).toEqual({
         userId: USER_ID,
         accessToken: ACCESS_TOKEN,
-        portfolioIds: expect.any(Set),
       });
       expect(authService.verifyAccessToken).toHaveBeenCalledWith(ACCESS_TOKEN);
     });
@@ -160,7 +180,7 @@ describe('PortfolioGateway', () => {
         ok: false,
         error: { code: 'VALIDATION_ERROR', message: expect.any(String) },
       });
-      expect(valuationService.getValuation).not.toHaveBeenCalled();
+      expect(subscriptionService.subscribe).not.toHaveBeenCalled();
     });
 
     it('rejects a null / array / non-object payload with VALIDATION_ERROR', async () => {
@@ -172,29 +192,42 @@ describe('PortfolioGateway', () => {
           error: { code: 'VALIDATION_ERROR', message: expect.any(String) },
         });
       }
-      expect(valuationService.getValuation).not.toHaveBeenCalled();
+      expect(subscriptionService.subscribe).not.toHaveBeenCalled();
     });
 
-    it('subscribes to an owned portfolio and emits one initial valuation to the subscribing socket only', async () => {
-      valuationService.getValuation.mockResolvedValue(valuation);
+    it('delegates to the registry and emits one initial valuation to the subscribing socket only', async () => {
+      subscriptionService.subscribe.mockResolvedValue(subscribedResult);
       const { socket, emit, join } = makeSocket();
       const ack = await gateway.handleSubscribe(
         { portfolioId: PORTFOLIO_ID },
         socket,
       );
-      expect(valuationService.getValuation).toHaveBeenCalledTimes(1);
-      expect(valuationService.getValuation).toHaveBeenCalledWith(
-        USER_ID,
-        ACCESS_TOKEN,
-        PORTFOLIO_ID,
-      );
+      // Lifecycle state is delegated; the registry is the authoritative owner.
+      expect(subscriptionService.subscribe).toHaveBeenCalledTimes(1);
+      expect(subscriptionService.subscribe).toHaveBeenCalledWith({
+        socketId: SOCKET_ID,
+        userId: USER_ID,
+        accessToken: ACCESS_TOKEN,
+        portfolioId: PORTFOLIO_ID,
+      });
       expect(ack).toEqual({
         ok: true,
         portfolioId: PORTFOLIO_ID,
         subscribed: true,
       });
+      // The gateway confirms the exact attempt is still active before transport.
+      expect(subscriptionService.confirmActive).toHaveBeenCalledWith(
+        SOCKET_ID,
+        USER_ID,
+        PORTFOLIO_ID,
+        subscribedResult.attemptId,
+      );
+      expect(join).toHaveBeenCalledTimes(1);
       expect(join).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
-      expect(socket.data.portfolioIds.has(PORTFOLIO_ID)).toBe(true);
+      expect(socket.data).toEqual({
+        userId: USER_ID,
+        accessToken: ACCESS_TOKEN,
+      });
       expect(emit).toHaveBeenCalledTimes(1);
       const [event, payload] = emit.mock.calls[0];
       expect(event).toBe(PORTFOLIO_VALUATION_EVENT);
@@ -203,11 +236,9 @@ describe('PortfolioGateway', () => {
       expect(new Date(payload.emittedAt).toISOString()).toBe(payload.emittedAt);
     });
 
-    it('is idempotent for a duplicate subscription (no re-validation or re-join)', async () => {
-      valuationService.getValuation.mockResolvedValue(valuation);
-      const { socket, join } = makeSocket({
-        portfolioIds: new Set([PORTFOLIO_ID]),
-      });
+    it('acknowledges a duplicate as subscribed:false without joining or emitting', async () => {
+      subscriptionService.subscribe.mockResolvedValue({ kind: 'duplicate' });
+      const { socket, emit, join } = makeSocket();
       const ack = await gateway.handleSubscribe(
         { portfolioId: PORTFOLIO_ID },
         socket,
@@ -217,45 +248,97 @@ describe('PortfolioGateway', () => {
         portfolioId: PORTFOLIO_ID,
         subscribed: false,
       });
-      expect(valuationService.getValuation).not.toHaveBeenCalled();
       expect(join).not.toHaveBeenCalled();
+      expect(emit).not.toHaveBeenCalled();
     });
 
-    it('reserves the portfolio before the first await so two concurrent subscribes cannot both value it', async () => {
-      let resolveValuation!: (value: PortfolioValuationDto) => void;
-      const gate = new Promise<PortfolioValuationDto>((resolve) => {
-        resolveValuation = resolve;
+    it('does not join or emit for an obsolete result (attempt cancelled mid-flight)', async () => {
+      subscriptionService.subscribe.mockResolvedValue({ kind: 'obsolete' });
+      const { socket, emit, join } = makeSocket();
+      const ack = await gateway.handleSubscribe(
+        { portfolioId: PORTFOLIO_ID },
+        socket,
+      );
+      expect(ack).toEqual({
+        ok: true,
+        portfolioId: PORTFOLIO_ID,
+        subscribed: false,
       });
-      valuationService.getValuation.mockReturnValue(gate);
+      expect(join).not.toHaveBeenCalled();
+      expect(emit).not.toHaveBeenCalled();
+    });
+
+    it('emits only for a genuinely active current attempt (skips transport when confirmActive fails)', async () => {
+      subscriptionService.subscribe.mockResolvedValue(subscribedResult);
+      subscriptionService.confirmActive.mockReturnValue(false);
+      const { socket, emit, join } = makeSocket();
+      const ack = await gateway.handleSubscribe(
+        { portfolioId: PORTFOLIO_ID },
+        socket,
+      );
+      expect(ack).toEqual({
+        ok: true,
+        portfolioId: PORTFOLIO_ID,
+        subscribed: false,
+      });
+      expect(join).not.toHaveBeenCalled();
+      expect(emit).not.toHaveBeenCalled();
+    });
+
+    it('backs out (leaves the room) if the attempt stops being active before emission', async () => {
+      subscriptionService.subscribe.mockResolvedValue(subscribedResult);
+      // Active before the join, obsolete immediately after it.
+      subscriptionService.confirmActive
+        .mockReturnValueOnce(true)
+        .mockReturnValueOnce(false);
+      const { socket, emit, join, leave } = makeSocket();
+      const ack = await gateway.handleSubscribe(
+        { portfolioId: PORTFOLIO_ID },
+        socket,
+      );
+      expect(ack).toEqual({
+        ok: true,
+        portfolioId: PORTFOLIO_ID,
+        subscribed: false,
+      });
+      expect(join).toHaveBeenCalledTimes(1);
+      expect(leave).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
+      expect(emit).not.toHaveBeenCalled();
+    });
+
+    it('does not double-join or double-emit when a second subscribe races a pending one', async () => {
+      let resolveFirst!: (result: typeof subscribedResult) => void;
+      const gate = new Promise<typeof subscribedResult>((resolve) => {
+        resolveFirst = resolve;
+      });
+      subscriptionService.subscribe
+        .mockReturnValueOnce(gate)
+        .mockResolvedValueOnce({ kind: 'duplicate' });
 
       const { socket, emit, join } = makeSocket();
 
-      // Start the first subscribe: it validates, reserves the portfolio, then
-      // suspends on the still-pending getValuation.
+      // First subscribe suspends on the registry's pending attempt.
       const first = gateway.handleSubscribe(
         { portfolioId: PORTFOLIO_ID },
         socket,
       );
       await flush();
 
-      // Start the second subscribe before the first valuation resolves.
+      // The registry reports the concurrent second attempt as a duplicate.
       const second = await gateway.handleSubscribe(
         { portfolioId: PORTFOLIO_ID },
         socket,
       );
-
-      // The up-front reservation made the second a duplicate — no second
-      // valuation/authorization pass and no emission yet.
       expect(second).toEqual({
         ok: true,
         portfolioId: PORTFOLIO_ID,
         subscribed: false,
       });
-      expect(valuationService.getValuation).toHaveBeenCalledTimes(1);
+      expect(join).not.toHaveBeenCalled();
       expect(emit).not.toHaveBeenCalled();
 
       // Let the first subscription complete: one join, one valuation event.
-      resolveValuation(valuation);
+      resolveFirst(subscribedResult);
       const firstAck = await first;
       expect(firstAck).toEqual({
         ok: true,
@@ -267,49 +350,54 @@ describe('PortfolioGateway', () => {
       expect(emit).toHaveBeenCalledTimes(1);
     });
 
-    it('releases the reservation on failure so a later legitimate retry can subscribe', async () => {
+    it('rolls back only the matching attempt when the room join throws', async () => {
+      subscriptionService.subscribe.mockResolvedValue(subscribedResult);
       const { socket, emit, join, leave } = makeSocket();
-
-      valuationService.getValuation.mockRejectedValueOnce(
-        new ServiceUnavailableException('provider down'),
-      );
-      const failed = await gateway.handleSubscribe(
-        { portfolioId: PORTFOLIO_ID },
-        socket,
-      );
-      expect(failed).toEqual({
-        ok: false,
-        error: { code: 'MARKET_UNAVAILABLE', message: expect.any(String) },
+      join.mockImplementation(() => {
+        throw new Error('adapter down');
       });
-      // The reservation is gone and the room is left defensively.
-      expect(socket.data.portfolioIds.has(PORTFOLIO_ID)).toBe(false);
-      expect(leave).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
-      expect(join).not.toHaveBeenCalled();
-      expect(emit).not.toHaveBeenCalled();
 
-      // A later retry is no longer a duplicate — it re-validates and succeeds.
-      valuationService.getValuation.mockResolvedValue(valuation);
-      const retry = await gateway.handleSubscribe(
+      const ack = await gateway.handleSubscribe(
         { portfolioId: PORTFOLIO_ID },
         socket,
       );
-      expect(retry).toEqual({
+      // Transport failure after activation: matching rollback + neutral error.
+      expect(subscriptionService.rollbackSubscription).toHaveBeenCalledTimes(1);
+      expect(subscriptionService.rollbackSubscription).toHaveBeenCalledWith(
+        SOCKET_ID,
+        USER_ID,
+        PORTFOLIO_ID,
+        subscribedResult.attemptId,
+      );
+      expect(leave).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
+      expect(emit).not.toHaveBeenCalled();
+      expect(ack).toEqual({
+        ok: false,
+        error: { code: 'INTERNAL_ERROR', message: expect.any(String) },
+      });
+    });
+
+    it('does not join, emit, or roll back when the registry reports a subscribe failure after a retry replaced the attempt', async () => {
+      // A second subscribe already replaced the obsolete first attempt, so the
+      // first attempt must not be rolled back over the newer one.
+      subscriptionService.subscribe.mockResolvedValue({ kind: 'obsolete' });
+      const { socket, emit, join } = makeSocket();
+      const ack = await gateway.handleSubscribe(
+        { portfolioId: PORTFOLIO_ID },
+        socket,
+      );
+      expect(ack).toEqual({
         ok: true,
         portfolioId: PORTFOLIO_ID,
-        subscribed: true,
+        subscribed: false,
       });
-      expect(valuationService.getValuation).toHaveBeenCalledTimes(2);
-      expect(join).toHaveBeenCalledTimes(1);
-      expect(join).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
-      expect(emit).toHaveBeenCalledTimes(1);
+      expect(join).not.toHaveBeenCalled();
+      expect(emit).not.toHaveBeenCalled();
+      expect(subscriptionService.rollbackSubscription).not.toHaveBeenCalled();
     });
 
     it('maps a missing/foreign portfolio to PORTFOLIO_NOT_FOUND with a single neutral message', async () => {
-      // The gateway never inspects the cause beyond NotFoundException, so a
-      // missing portfolio and another user's portfolio (both throw it from the
-      // valuation service) produce the identical, neutral response — no
-      // existence leak.
-      valuationService.getValuation.mockRejectedValue(
+      subscriptionService.subscribe.mockRejectedValue(
         new NotFoundException('Portfolio not found.'),
       );
       const { socket } = makeSocket();
@@ -329,8 +417,8 @@ describe('PortfolioGateway', () => {
         new ServiceUnavailableException('provider down'),
         new HttpException('provider error', 502),
       ]) {
-        valuationService.getValuation.mockRejectedValue(error);
-        const { socket } = makeSocket();
+        subscriptionService.subscribe.mockRejectedValue(error);
+        const { socket, emit, join } = makeSocket();
         const ack = await gateway.handleSubscribe(
           { portfolioId: PORTFOLIO_ID },
           socket,
@@ -339,12 +427,13 @@ describe('PortfolioGateway', () => {
           ok: false,
           error: { code: 'MARKET_UNAVAILABLE', message: expect.any(String) },
         });
-        expect(socket.data.portfolioIds.has(PORTFOLIO_ID)).toBe(false);
+        expect(join).not.toHaveBeenCalled();
+        expect(emit).not.toHaveBeenCalled();
       }
     });
 
     it('maps unexpected failures to INTERNAL_ERROR', async () => {
-      valuationService.getValuation.mockRejectedValue(
+      subscriptionService.subscribe.mockRejectedValue(
         new Error('boom — not an HttpException'),
       );
       const { socket } = makeSocket();
@@ -360,26 +449,30 @@ describe('PortfolioGateway', () => {
   });
 
   describe('portfolio:unsubscribe', () => {
-    it('unsubscribes from a subscribed portfolio', async () => {
-      const { socket, leave } = makeSocket({
-        portfolioIds: new Set([PORTFOLIO_ID]),
-      });
+    it('delegates cleanup to the registry and leaves the room', async () => {
+      const { socket, leave } = makeSocket();
       const ack = await gateway.handleUnsubscribe(
         { portfolioId: PORTFOLIO_ID },
         socket,
       );
-      expect(ack).toEqual({ ok: true, portfolioId: PORTFOLIO_ID });
-      expect(socket.data.portfolioIds.has(PORTFOLIO_ID)).toBe(false);
+      expect(subscriptionService.unsubscribe).toHaveBeenCalledTimes(1);
+      expect(subscriptionService.unsubscribe).toHaveBeenCalledWith(
+        SOCKET_ID,
+        USER_ID,
+        PORTFOLIO_ID,
+      );
       expect(leave).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
+      expect(ack).toEqual({ ok: true, portfolioId: PORTFOLIO_ID });
     });
 
-    it('is idempotent for a portfolio that is not subscribed', async () => {
+    it('is idempotent for a portfolio that is not subscribed (still delegates, reveals nothing)', async () => {
       const { socket, leave } = makeSocket();
       const ack = await gateway.handleUnsubscribe(
         { portfolioId: PORTFOLIO_ID },
         socket,
       );
       expect(ack).toEqual({ ok: true, portfolioId: PORTFOLIO_ID });
+      expect(subscriptionService.unsubscribe).toHaveBeenCalledTimes(1);
       expect(leave).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
     });
 
@@ -393,21 +486,22 @@ describe('PortfolioGateway', () => {
         ok: false,
         error: { code: 'VALIDATION_ERROR', message: expect.any(String) },
       });
+      expect(subscriptionService.unsubscribe).not.toHaveBeenCalled();
     });
   });
 
   describe('disconnect cleanup', () => {
-    it('clears every tracked subscription', () => {
-      const { socket } = makeSocket({
-        portfolioIds: new Set([PORTFOLIO_ID, 'other-uuid']),
-      });
+    it('delegates complete socket cleanup to the registry', () => {
+      const { socket } = makeSocket();
       gateway.handleDisconnect(socket);
-      expect(socket.data.portfolioIds.size).toBe(0);
+      expect(subscriptionService.disconnect).toHaveBeenCalledTimes(1);
+      expect(subscriptionService.disconnect).toHaveBeenCalledWith(SOCKET_ID);
     });
 
-    it('tolerates sockets that never authenticated', () => {
+    it('tolerates sockets that never authenticated (registry no-ops)', () => {
       const socket = {} as PortfolioSocket;
       expect(() => gateway.handleDisconnect(socket)).not.toThrow();
+      expect(subscriptionService.disconnect).toHaveBeenCalledTimes(1);
     });
   });
 });

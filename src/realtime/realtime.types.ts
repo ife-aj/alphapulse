@@ -69,13 +69,16 @@ export type PortfolioConnectErrorCode = 'UNAUTHORIZED';
 
 /**
  * Per-socket state attached by the gateway after a successful handshake.
- * Lives on `socket.data`, so it is garbage-collected with the socket — the
- * gateway keeps no separate registry of sockets, subscriptions, or tokens.
+ *
+ * Only the verified identity and its transient access token live here. The
+ * access token is the gateway's per-socket authenticated data (kept only here,
+ * never in the subscription registry). Subscription bookkeeping no longer
+ * lives on `socket.data`: `RealtimeSubscriptionService` is the authoritative
+ * registry, keyed by socket id.
  */
 export interface PortfolioSocketData {
   userId: string;
   accessToken: string;
-  portfolioIds: Set<string>;
 }
 
 /** Typed client → server event map (the acknowledged subscribe/unsubscribe). */
