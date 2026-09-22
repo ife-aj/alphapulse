@@ -381,6 +381,23 @@ export class RealtimeSubscriptionService {
     return this.symbolPortfolios.get(normalizeSymbol(symbol))?.size ?? 0;
   }
 
+  /**
+   * Every normalized symbol currently required by at least one active portfolio
+   * — the input a refresh cycle fetches, each symbol once regardless of how many
+   * portfolios hold it.
+   *
+   * The symbol index is the source of truth: `dropPortfolioSymbol` deletes an
+   * entry as soon as its last portfolio releases it, so these keys are exactly
+   * the live symbols (a portfolio with no holdings contributes none).
+   *
+   * Sorted, because the index's insertion order follows subscription history and
+   * would otherwise make the snapshot's ordering depend on it. A fresh array:
+   * mutating the result cannot corrupt the registry.
+   */
+  getActiveSymbols(): string[] {
+    return [...this.symbolPortfolios.keys()].sort();
+  }
+
   // --- Internal lifecycle helpers ---
 
   /**

@@ -1,4 +1,5 @@
 import type { Socket } from 'socket.io';
+import type Decimal from 'decimal.js';
 import type { PortfolioValuationDto } from '../portfolios/dto/valuation-response.dto';
 
 /**
@@ -114,4 +115,34 @@ export type PortfolioSocket = Socket<
  */
 export function portfolioRoom(userId: string, portfolioId: string): string {
   return `portfolio:${userId}:${portfolioId}`;
+}
+
+/**
+ * Exact live price for each symbol successfully priced in one refresh cycle.
+ *
+ * Values are `Decimal`, never a JS `number`: the provider's numeric price is
+ * converted exactly once at the market boundary and every later phase reuses
+ * that same value, so no precision is lost or re-derived downstream (the
+ * valuation computation consumes it directly as `currentPrice`).
+ *
+ * Created fresh for each cycle and treated as immutable by its consumers —
+ * including the callers that share one coalesced cycle. `ReadonlyMap` is a
+ * compile-time guarantee only; entries are normalized symbols.
+ */
+export type SymbolPriceMap = ReadonlyMap<string, Decimal>;
+
+/**
+ * Outcome of one price-refresh cycle.
+ *
+ * Partial failure is a normal shape here, not an error: a symbol that could not
+ * be priced is reported in `failedSymbols` while every other symbol's price is
+ * still returned. A failed symbol is *omitted* from `prices` rather than
+ * defaulted — substituting a zero for a real price would silently corrupt every
+ * figure computed from it.
+ */
+export interface RealtimePriceRefreshResult {
+  /** Normalized symbol → exact provider price. Successful symbols only. */
+  prices: SymbolPriceMap;
+  /** Normalized symbols that could not be priced this cycle, in symbol order. */
+  failedSymbols: string[];
 }

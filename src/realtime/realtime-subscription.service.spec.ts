@@ -981,6 +981,74 @@ describe('RealtimeSubscriptionService', () => {
     });
   });
 
+  describe('active symbol inspection', () => {
+    it('returns no symbols for an idle registry', () => {
+      const { service } = makeService();
+      expect(service.getActiveSymbols()).toEqual([]);
+    });
+
+    it('returns a fresh, normalized, sorted snapshot of active symbols', async () => {
+      const { valuation, service } = makeService();
+      // Raw casing in the provider rows must not leak into the snapshot.
+      stubHoldings(valuation, ['msft', 'AAPL']);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+
+      expect(service.getActiveSymbols()).toEqual(['AAPL', 'MSFT']);
+
+      // A fresh copy: mutating what a caller received cannot corrupt the
+      // registry's own symbol index.
+      const snapshot = service.getActiveSymbols();
+      snapshot.push('HACK');
+      snapshot.length = 0;
+      expect(service.getActiveSymbols()).toEqual(['AAPL', 'MSFT']);
+    });
+
+    it('lists a shared symbol once and drops it when its last portfolio releases it', async () => {
+      const { valuation, service } = makeService();
+      valuation.getValuationHoldings.mockImplementation(
+        (_userId: string, _token: string, portfolioId: string) =>
+          Promise.resolve(
+            portfolioId === PORTFOLIO_1
+              ? holdings('AAPL')
+              : holdings('AAPL', 'MSFT'),
+          ),
+      );
+      valuation.valueHoldings.mockImplementation((portfolioId: string) =>
+        Promise.resolve(valuationFor(portfolioId)),
+      );
+
+      // Two portfolios both require AAPL; only P2 requires MSFT.
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_2);
+      expect(service.getActiveSymbols()).toEqual(['AAPL', 'MSFT']);
+      expect(service.symbolReferenceCount('AAPL')).toBe(2);
+
+      // P1 releases AAPL, but P2 still requires it — the symbol stays active.
+      service.unsubscribe(SOCKET_A, USER_ID, PORTFOLIO_1);
+      expect(service.getActiveSymbols()).toEqual(['AAPL', 'MSFT']);
+      expect(service.symbolReferenceCount('AAPL')).toBe(1);
+
+      // P2 holds the last references, so both symbols go.
+      service.unsubscribe(SOCKET_B, USER_ID, PORTFOLIO_2);
+      expect(service.getActiveSymbols()).toEqual([]);
+      expect(service.symbolReferenceCount('AAPL')).toBe(0);
+      expect(service.symbolReferenceCount('MSFT')).toBe(0);
+    });
+
+    it('omits symbols of a portfolio that holds nothing', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, []);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+
+      expect(service.getActiveSymbols()).toEqual([]);
+      expect(service.getPortfolioSocketIds(USER_ID, PORTFOLIO_1)).toEqual([
+        SOCKET_A,
+      ]);
+    });
+  });
+
   describe('inspection boundaries', () => {
     it('never leaks internal mutable maps or sets through inspection methods', async () => {
       const { valuation, service } = makeService();
