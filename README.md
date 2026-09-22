@@ -29,9 +29,14 @@ delivers that same valuation live per subscription — see
   returns a neutral `{ user: null, session: null }` and a login is required to
   obtain a session.
 - **Database** — Supabase Postgres. User-owned tables are protected by Row
-  Level Security (see [RLS ownership model](#rls-ownership-model)); the API
-  talks to them with the **anon key plus the user's access token** and never
-  uses the secret `service_role` key.
+  Level Security (see [RLS ownership model](#rls-ownership-model)). Request-time
+  access talks to them with the **anon key plus the user's access token**, so
+  the database enforces ownership for every user-facing read and write. One
+  narrow exception exists: the server also holds the **service-role key**, used
+  only by trusted internal realtime valuation reads that cannot depend on an
+  expiring user session. That client bypasses RLS, so the code that uses it
+  enforces ownership explicitly instead (see
+  [Internal reads](#internal-reads-and-the-service-role-key)).
 
 ## Prerequisites
 
@@ -63,10 +68,22 @@ there is no silent misconfiguration.
 | `DEFAULT_SYMBOLS`            | optional | Symbols for `GET /api/market/quotes` when none are given                                  |
 | `SUPABASE_URL`               | yes      | Supabase project URL (Project Settings > API)                                             |
 | `SUPABASE_ANON_KEY`          | yes      | Supabase **anon/publishable** key — designed to be public, requests stay sandboxed by RLS |
+| `SUPABASE_SERVICE_ROLE_KEY`  | yes      | Supabase **service-role** key — **server-only**, bypasses RLS; see the warning below      |
 
-Never put the secret `service_role` key in `.env` or anywhere client-side. The
-project URL and anon key are not secrets; the values in `.env.example` are
-placeholders — replace them with your own project's values.
+`SUPABASE_ANON_KEY` and `SUPABASE_SERVICE_ROLE_KEY` are not interchangeable:
+
+- **`SUPABASE_ANON_KEY`** serves every user-facing and authenticated operation.
+  It is publishable by design: on its own it reads and writes nothing, because
+  every request it carries is scoped by RLS and the caller's access token.
+- **`SUPABASE_SERVICE_ROLE_KEY`** is a full-database credential used only by
+  trusted server-side internal reads, where no user session is available — see
+  [Internal reads and the service-role key](#internal-reads-and-the-service-role-key).
+
+The service-role value must **never** be committed, logged, sent to a browser,
+returned in a REST response or socket payload, or placed in a client-side
+environment variable (`NEXT_PUBLIC_*`, `VITE_*`, `REACT_APP_*`). Unlike the anon
+key, it is a secret in every sense. The values in `.env.example` are placeholders
+— replace them with your own project's values.
 
 ## Available commands
 
@@ -150,6 +167,36 @@ Because requests go through the anon key **plus the user's JWT**, the RLS
 policies keyed on `auth.uid()` are the authorization boundary. The server keeps
 a per-user Supabase client whose `Authorization` header carries the caller's
 access token.
+
+### Internal reads and the service-role key
+
+One server-side path cannot use a user's JWT: the realtime valuation pipeline
+has to load a portfolio's holdings on a schedule, long after the socket that
+subscribed may have sent its last request, and user access tokens expire. It
+therefore reads through the **service-role key**, which bypasses RLS entirely.
+
+Because RLS is not enforcing anything on that path, ownership is enforced in the
+query instead, and the ordering below is load-bearing rather than defensive:
+
+1. `portfolios` is queried with **both** `id = portfolioId` **and**
+   `user_id = userId`. A portfolio id alone is never sufficient, and the
+   ownership check never runs without the user id.
+2. Only once an owner is proven are `holdings` read — by `portfolio_id`.
+   `holdings` has no `user_id` column of its own (ownership is inherited from
+   its parent portfolio), so it is unreachable without step 1.
+
+A portfolio that does not exist and a portfolio belonging to someone else both
+produce the same neutral `404 Portfolio not found.`, because on this client a
+foreign portfolio is simply absent. That 404 is byte-identical to the one the
+authenticated valuation path returns.
+
+This credential is confined to a single provider, `InternalHoldingsService`: its
+client is private, built lazily on first use, reused thereafter, and never
+returned to any caller. The service exposes exactly one operation, returning
+plain holdings — no code path hands out a privileged Supabase client, and no
+controller injects it. Authenticated REST reads are unchanged and still go
+through the anon-key client with the caller's token; the service-role key
+replaces nothing.
 
 ## Portfolio tracking
 

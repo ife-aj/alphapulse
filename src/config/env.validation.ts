@@ -11,7 +11,9 @@
  */
 
 /** Config values passed to ConfigModule.forRoot's `validate` option are always strings (from .env / process.env). */
-export function validateEnv(config: Record<string, unknown>): Record<string, unknown> {
+export function validateEnv(
+  config: Record<string, unknown>,
+): Record<string, unknown> {
   const errors: string[] = [];
 
   // API keys are useless empty; fail fast rather than emit 401s at request time.
@@ -29,7 +31,17 @@ export function validateEnv(config: Record<string, unknown>): Record<string, unk
   }
   requireNonEmpty(config, errors, 'SUPABASE_ANON_KEY');
 
-  if (config['MARKET_PROVIDER_TIMEOUT_MS'] !== undefined && !isPositiveInt(config['MARKET_PROVIDER_TIMEOUT_MS'])) {
+  // SERVER-ONLY. The service-role key bypasses Row Level Security and is used
+  // exclusively by trusted internal reads (realtime valuation must not depend on
+  // an expiring user session). It is validated exactly like every other
+  // credential — a missing one fails the bootstrap — and must never reach a
+  // browser, a log line, or a public payload.
+  requireNonEmpty(config, errors, 'SUPABASE_SERVICE_ROLE_KEY');
+
+  if (
+    config['MARKET_PROVIDER_TIMEOUT_MS'] !== undefined &&
+    !isPositiveInt(config['MARKET_PROVIDER_TIMEOUT_MS'])
+  ) {
     errors.push('MARKET_PROVIDER_TIMEOUT_MS must be a positive integer (ms)');
   }
 
@@ -43,12 +55,17 @@ export function validateEnv(config: Record<string, unknown>): Record<string, unk
     }
   }
 
-  if (config['DEFAULT_SYMBOLS'] !== undefined && !isSymbolList(config['DEFAULT_SYMBOLS'])) {
+  if (
+    config['DEFAULT_SYMBOLS'] !== undefined &&
+    !isSymbolList(config['DEFAULT_SYMBOLS'])
+  ) {
     errors.push('DEFAULT_SYMBOLS must be a comma-separated list of symbols');
   }
 
   if (errors.length > 0) {
-    throw new Error(`Invalid environment configuration:\n- ${errors.join('\n- ')}`);
+    throw new Error(
+      `Invalid environment configuration:\n- ${errors.join('\n- ')}`,
+    );
   }
 
   return config;
@@ -87,5 +104,10 @@ function isHttpUrl(value: unknown): boolean {
 
 function isSymbolList(value: unknown): boolean {
   if (typeof value !== 'string') return false;
-  return value.split(',').map((s) => s.trim()).filter(Boolean).length > 0;
+  return (
+    value
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean).length > 0
+  );
 }

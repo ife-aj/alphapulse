@@ -15,3 +15,8 @@ process.env.MARKET_PROVIDER_TIMEOUT_MS = '5000';
 // independent of the developer's real .env. No spec hits live Supabase.
 process.env.SUPABASE_URL = 'https://e2e-dummy.supabase.co';
 process.env.SUPABASE_ANON_KEY = 'e2e-dummy-supabase-anon-key';
+// Server-only service-role key, required by validateEnv. Nothing in the suite
+// exercises the internal reader that consumes it, and constructing a Supabase
+// client opens no socket — so a dummy value keeps every e2e boot independent of
+// the developer's real .env without ever reaching live Supabase.
+process.env.SUPABASE_SERVICE_ROLE_KEY = 'e2e-dummy-supabase-service-role-key';

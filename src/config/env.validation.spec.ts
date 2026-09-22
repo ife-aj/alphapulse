@@ -9,7 +9,10 @@ const validConfig: Record<string, unknown> = {
   FINNHUB_BASE_URL: 'https://finnhub.io/api/v1',
   TWELVE_DATA_BASE_URL: 'https://api.twelvedata.com',
   SUPABASE_URL: 'https://abcdefghijk.supabase.co',
-  SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.dummy-signature',
+  SUPABASE_ANON_KEY:
+    'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.dummy-signature',
+  SUPABASE_SERVICE_ROLE_KEY:
+    'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.dummy-signature',
   DEFAULT_SYMBOLS: 'AAPL,MSFT,NVDA',
 };
 
@@ -27,7 +30,10 @@ describe('validateEnv', () => {
       FINNHUB_API_KEY: 'finnhub-key',
       TWELVE_DATA_API_KEY: 'twelve-data-key',
       SUPABASE_URL: 'https://abcdefghijk.supabase.co',
-      SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.dummy-signature',
+      SUPABASE_ANON_KEY:
+        'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoiYW5vbiJ9.dummy-signature',
+      SUPABASE_SERVICE_ROLE_KEY:
+        'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.dummy-signature',
     };
     expect(() => validateEnv(minimal)).not.toThrow();
   });
@@ -64,6 +70,21 @@ describe('validateEnv', () => {
       validateEnv({ ...validConfig, SUPABASE_ANON_KEY: '   ' }),
     ).toThrow(/SUPABASE_ANON_KEY/);
   });
+
+  it('throws when SUPABASE_SERVICE_ROLE_KEY is missing', () => {
+    const broken = { ...validConfig };
+    delete broken.SUPABASE_SERVICE_ROLE_KEY;
+    expect(() => validateEnv(broken)).toThrow(/SUPABASE_SERVICE_ROLE_KEY/);
+  });
+
+  it.each(['', '   '])(
+    'throws when SUPABASE_SERVICE_ROLE_KEY is %s (blank)',
+    (value) => {
+      expect(() =>
+        validateEnv({ ...validConfig, SUPABASE_SERVICE_ROLE_KEY: value }),
+      ).toThrow(/SUPABASE_SERVICE_ROLE_KEY/);
+    },
+  );
 
   it.each(['abc', '-5', '0', '5.5'])(
     'throws when MARKET_PROVIDER_TIMEOUT_MS is %s (not a positive integer)',
@@ -110,6 +131,7 @@ describe('validateEnv', () => {
     expect(error!.message).toContain('FINNHUB_API_KEY');
     expect(error!.message).toContain('TWELVE_DATA_API_KEY');
     expect(error!.message).toContain('SUPABASE_URL');
+    expect(error!.message).toContain('SUPABASE_SERVICE_ROLE_KEY');
     expect(error!.message).toContain('PORT');
   });
 });

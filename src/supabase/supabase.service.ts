@@ -3,7 +3,16 @@ import { ConfigService } from '@nestjs/config';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 
 /**
- * Owns Supabase client construction for the process.
+ * Owns construction of the process's *user-facing* Supabase clients — every
+ * client built here uses the anon/publishable key and is therefore scoped by
+ * Row Level Security to whatever the caller is allowed to see.
+ *
+ * The one credential that is deliberately NOT built here is the server-only
+ * service-role client used for trusted internal reads: it bypasses RLS, so
+ * exposing a factory for it from a service that several modules inject would put
+ * a full-database handle one call away from any controller. That client lives
+ * privately inside `InternalHoldingsService`, which is the only thing that uses
+ * it. Nothing in this class reads or knows about the service-role key.
  *
  * The clients are built from SUPABASE_URL + SUPABASE_ANON_KEY read through
  * ConfigService — never hard-coded. validateEnv guarantees both exist before
