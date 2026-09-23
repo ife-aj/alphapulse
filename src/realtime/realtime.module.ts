@@ -4,6 +4,7 @@ import { MarketModule } from '../market/market.module';
 import { PortfoliosModule } from '../portfolios/portfolios.module';
 import { PortfolioGateway } from './portfolio.gateway';
 import { RealtimePriceRefreshService } from './realtime-price-refresh.service';
+import { RealtimeRecalculationScheduler } from './realtime-recalculation-scheduler.service';
 import { RealtimeRecalculationService } from './realtime-recalculation.service';
 import { RealtimeSubscriptionService } from './realtime-subscription.service';
 
@@ -24,8 +25,15 @@ import { RealtimeSubscriptionService } from './realtime-subscription.service';
  * `InternalHoldingsService` (the service-role reader, which is why
  * `PortfoliosModule` exports it), prices the union of those holdings once
  * through `RealtimePriceRefreshService`, and values every portfolio from that
- * one shared price map with `PortfoliosValuationService`. It is timer-free and
- * broadcast-free: it computes and returns, and nothing schedules it yet.
+ * one shared price map with `PortfoliosValuationService`. It computes and
+ * returns; it schedules and broadcasts nothing.
+ *
+ * `RealtimeRecalculationScheduler` is the lifecycle owner: it drives that cycle
+ * on a recursive timer (`REALTIME_REFRESH_INTERVAL_MS`, 60000ms by default),
+ * skips entirely while no portfolio is active, and publishes each completed
+ * result through `PortfolioGateway` — a `portfolio:valuation` to the portfolio's
+ * room, or a sanitized `portfolio:error`. It starts with the module and stops
+ * with it.
  *
  * Both services reuse `AuthService` (handshake token verification) and
  * `PortfoliosValuationService` (authorization + exact-decimal valuation) from
@@ -40,6 +48,7 @@ import { RealtimeSubscriptionService } from './realtime-subscription.service';
     RealtimeSubscriptionService,
     RealtimePriceRefreshService,
     RealtimeRecalculationService,
+    RealtimeRecalculationScheduler,
     PortfolioGateway,
   ],
 })

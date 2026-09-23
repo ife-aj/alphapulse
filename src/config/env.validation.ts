@@ -45,6 +45,17 @@ export function validateEnv(
     errors.push('MARKET_PROVIDER_TIMEOUT_MS must be a positive integer (ms)');
   }
 
+  // Cadence of the realtime recalculation cycle. Optional — the scheduler
+  // defaults to 60000ms — but a configured value must be a positive integer:
+  // zero or a negative would arm a timer that fires immediately, in a loop,
+  // and a non-numeric value would silently fall back rather than being noticed.
+  if (
+    config['REALTIME_REFRESH_INTERVAL_MS'] !== undefined &&
+    !isPositiveInt(config['REALTIME_REFRESH_INTERVAL_MS'])
+  ) {
+    errors.push('REALTIME_REFRESH_INTERVAL_MS must be a positive integer (ms)');
+  }
+
   if (config['PORT'] !== undefined && !isPort(config['PORT'])) {
     errors.push('PORT must be an integer between 1 and 65535');
   }

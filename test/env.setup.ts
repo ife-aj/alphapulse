@@ -10,6 +10,11 @@
 process.env.FINNHUB_API_KEY = 'e2e-dummy-finnhub-key';
 process.env.TWELVE_DATA_API_KEY = 'e2e-dummy-twelve-data-key';
 process.env.MARKET_PROVIDER_TIMEOUT_MS = '5000';
+// Scheduled realtime recalculation. Optional (the scheduler defaults to 60000),
+// but pinned here to a deliberately long interval so no suite depends on a
+// cycle firing mid-test: the specs drive subscriptions explicitly, and any
+// scheduled broadcast would race the assertions they make about emitted events.
+process.env.REALTIME_REFRESH_INTERVAL_MS = '3600000';
 // Supabase keys are now required by validateEnv. The app only *constructs* the
 // client at boot (no network call), so a dummy URL/key keep the suite
 // independent of the developer's real .env. No spec hits live Supabase.

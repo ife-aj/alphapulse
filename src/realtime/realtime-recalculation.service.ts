@@ -114,6 +114,9 @@ function failure(
     ok: false,
     userId: identity.userId,
     portfolioId: identity.portfolioId,
+    // Carried through untouched: the broadcaster needs to know which activation
+    // this was computed for, and the cycle is the only place that knows.
+    revision: identity.revision,
     code,
     unpricedSymbols,
   };
@@ -261,6 +264,7 @@ export class RealtimeRecalculationService {
         ok: true,
         userId: identity.userId,
         portfolioId: identity.portfolioId,
+        revision: identity.revision,
         valuation: this.valuation.valueHoldingsWithPrices(
           identity.portfolioId,
           holdings,

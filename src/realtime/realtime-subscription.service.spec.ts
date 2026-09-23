@@ -112,6 +112,18 @@ function stubHoldings(valuation: ValuationStub, symbols: string[]): void {
   valuation.valueHoldings.mockResolvedValue(valuationFor(PORTFOLIO_1));
 }
 
+/**
+ * The (userId, portfolioId) pairs of an active-portfolio snapshot, in order.
+ * Ordering and membership tests use this; the revision is covered separately.
+ */
+function activeIdentities(
+  service: RealtimeSubscriptionService,
+): { userId: string; portfolioId: string }[] {
+  return service
+    .getActivePortfolioIdentities()
+    .map(({ userId, portfolioId }) => ({ userId, portfolioId }));
+}
+
 describe('RealtimeSubscriptionService', () => {
   describe('portfolio identity keys', () => {
     it('maps equal userId/portfolioId values onto the same registry entry, however they were constructed', async () => {
@@ -1063,7 +1075,7 @@ describe('RealtimeSubscriptionService', () => {
       await subscribe(service, SOCKET_A, OTHER_USER_ID, PORTFOLIO_2);
       await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_1);
 
-      expect(service.getActivePortfolioIdentities()).toEqual([
+      expect(activeIdentities(service)).toEqual([
         { userId: USER_ID, portfolioId: PORTFOLIO_1 },
         { userId: OTHER_USER_ID, portfolioId: PORTFOLIO_2 },
       ]);
@@ -1076,7 +1088,7 @@ describe('RealtimeSubscriptionService', () => {
       await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
       await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_1);
 
-      expect(service.getActivePortfolioIdentities()).toEqual([
+      expect(activeIdentities(service)).toEqual([
         { userId: USER_ID, portfolioId: PORTFOLIO_1 },
       ]);
     });
@@ -1094,7 +1106,7 @@ describe('RealtimeSubscriptionService', () => {
 
       gate.resolve(holdings('AAPL'));
       await pending;
-      expect(service.getActivePortfolioIdentities()).toEqual([
+      expect(activeIdentities(service)).toEqual([
         { userId: USER_ID, portfolioId: PORTFOLIO_1 },
       ]);
     });
@@ -1106,7 +1118,7 @@ describe('RealtimeSubscriptionService', () => {
       await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
       await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_2);
       service.unsubscribe(SOCKET_A, USER_ID, PORTFOLIO_1);
-      expect(service.getActivePortfolioIdentities()).toEqual([
+      expect(activeIdentities(service)).toEqual([
         { userId: USER_ID, portfolioId: PORTFOLIO_2 },
       ]);
 
@@ -1122,6 +1134,7 @@ describe('RealtimeSubscriptionService', () => {
       const snapshot = service.getActivePortfolioIdentities();
       expect(Object.keys(snapshot[0]).sort()).toEqual([
         'portfolioId',
+        'revision',
         'userId',
       ]);
       // The internal portfolio key encoding never escapes.
@@ -1130,12 +1143,77 @@ describe('RealtimeSubscriptionService', () => {
 
       // Mutating a returned copy must not corrupt the registry.
       snapshot[0].userId = 'HACK';
-      snapshot.push({ userId: 'HACK', portfolioId: 'HACK' });
+      snapshot.push({ userId: 'HACK', portfolioId: 'HACK', revision: 999 });
       snapshot.length = 0;
 
       expect(service.getActivePortfolioIdentities()).toEqual([
-        { userId: USER_ID, portfolioId: PORTFOLIO_1 },
+        { userId: USER_ID, portfolioId: PORTFOLIO_1, revision: 1 },
       ]);
+    });
+  });
+
+  describe('activation revisions', () => {
+    it('keeps one revision for the whole life of an activation', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, ['AAPL']);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      const [first] = service.getActivePortfolioIdentities();
+
+      // A second socket watching the same portfolio does not disturb it: that
+      // subscription has been live since the activation began.
+      await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_1);
+      const [afterSecondSocket] = service.getActivePortfolioIdentities();
+
+      expect(afterSecondSocket.revision).toBe(first.revision);
+      expect(
+        service.isActivePortfolio(USER_ID, PORTFOLIO_1, first.revision),
+      ).toBe(true);
+    });
+
+    it('gives a portfolio a new revision when it is subscribed again', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, ['AAPL']);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      const [original] = service.getActivePortfolioIdentities();
+
+      service.unsubscribe(SOCKET_A, USER_ID, PORTFOLIO_1);
+      expect(service.getActivePortfolioIdentities()).toEqual([]);
+      // The activation is gone, so its revision belongs to nobody.
+      expect(
+        service.isActivePortfolio(USER_ID, PORTFOLIO_1, original.revision),
+      ).toBe(false);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      const [resubscribed] = service.getActivePortfolioIdentities();
+
+      expect(resubscribed.revision).not.toBe(original.revision);
+      // The old revision stays dead even though the identity is active again.
+      expect(
+        service.isActivePortfolio(USER_ID, PORTFOLIO_1, original.revision),
+      ).toBe(false);
+      expect(
+        service.isActivePortfolio(USER_ID, PORTFOLIO_1, resubscribed.revision),
+      ).toBe(true);
+    });
+
+    it('never reports another user or a foreign revision as active', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, ['AAPL']);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      const [active] = service.getActivePortfolioIdentities();
+
+      expect(
+        service.isActivePortfolio(OTHER_USER_ID, PORTFOLIO_1, active.revision),
+      ).toBe(false);
+      expect(
+        service.isActivePortfolio(USER_ID, PORTFOLIO_2, active.revision),
+      ).toBe(false);
+      expect(
+        service.isActivePortfolio(USER_ID, PORTFOLIO_1, active.revision + 1),
+      ).toBe(false);
     });
   });
 

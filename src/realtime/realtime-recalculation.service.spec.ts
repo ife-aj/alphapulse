@@ -62,8 +62,9 @@ function holding(
 function identity(
   userId: string,
   portfolioId: string,
+  revision = 1,
 ): ActivePortfolioIdentity {
-  return { userId, portfolioId };
+  return { userId, portfolioId, revision };
 }
 
 function makeRegistry(identities: ActivePortfolioIdentity[] = []) {
@@ -819,6 +820,7 @@ describe('RealtimeRecalculationService', () => {
         'code',
         'ok',
         'portfolioId',
+        'revision',
         'unpricedSymbols',
         'userId',
       ]);

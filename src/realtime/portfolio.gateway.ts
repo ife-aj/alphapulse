@@ -20,6 +20,10 @@ import { SubscribePortfolioDto } from './dto/subscribe-portfolio.dto';
 import { RealtimeSubscriptionService } from './realtime-subscription.service';
 import type { RealtimeSubscribeResult } from './realtime-subscription.service';
 import {
+  INTERNAL_ERROR_MESSAGE,
+  MARKET_UNAVAILABLE_MESSAGE,
+  PORTFOLIO_NOT_FOUND_MESSAGE,
+  PORTFOLIO_ERROR_EVENT,
   PORTFOLIO_SUBSCRIBE_EVENT,
   PORTFOLIO_UNSUBSCRIBE_EVENT,
   PORTFOLIO_VALUATION_EVENT,
@@ -34,10 +38,6 @@ import {
 } from './realtime.types';
 
 const AUTH_FAILED_MESSAGE = 'Authentication failed.';
-const NOT_FOUND_MESSAGE = 'Portfolio not found.';
-const MARKET_UNAVAILABLE_MESSAGE =
-  'Unable to obtain a portfolio valuation right now.';
-const INTERNAL_MESSAGE = 'An unexpected error occurred.';
 const VALIDATION_MESSAGE = 'portfolioId must be a valid UUID.';
 
 /**
@@ -75,6 +75,14 @@ const VALIDATION_MESSAGE = 'portfolioId must be a valid UUID.';
 export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
   private readonly logger = new Logger(PortfolioGateway.name);
 
+  /**
+   * The Socket.IO server, captured once in `afterInit`. Null until the
+   * WebSocket layer is initialized, and never used before then: the scheduler
+   * that broadcasts through this gateway runs on a timer whose first tick is a
+   * whole interval after boot.
+   */
+  private server: Server | null = null;
+
   constructor(
     private readonly authService: AuthService,
     private readonly subscriptionService: RealtimeSubscriptionService,
@@ -87,6 +95,7 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
    * verified identity is stored on `socket.data`.
    */
   afterInit(server: Server): void {
+    this.server = server;
     server.use((socket, next) => {
       this.authenticateSocket(socket)
         .then(() => next())
@@ -125,6 +134,44 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
    */
   handleDisconnect(socket: PortfolioSocket): void {
     this.subscriptionService.disconnect(socket.id);
+  }
+
+  /**
+   * Push one update to every socket watching a portfolio.
+   *
+   * A single `to(room).emit` call: Socket.IO fans it out to the room, so two
+   * sockets on one portfolio cost one broadcast, not two. The room is the
+   * server-derived `portfolio:<userId>:<portfolioId>` name, never a client
+   * value, so a result can only ever reach sockets authenticated as that user.
+   *
+   * A no-op when the WebSocket layer is not initialized — there is nothing to
+   * broadcast to, and creating a server here would be the transport's job, not
+   * this method's.
+   */
+  broadcastValuation(
+    userId: string,
+    portfolioId: string,
+    event: PortfolioValuationEvent,
+  ): void {
+    this.server
+      ?.to(portfolioRoom(userId, portfolioId))
+      .emit(PORTFOLIO_VALUATION_EVENT, event);
+  }
+
+  /**
+   * Push one sanitized error to every socket watching a portfolio. Same room
+   * and same one-call fan-out as `broadcastValuation`; the payload is built by
+   * the caller from the socket contract's fixed messages, never from an
+   * exception.
+   */
+  broadcastPortfolioError(
+    userId: string,
+    portfolioId: string,
+    error: PortfolioSocketError,
+  ): void {
+    this.server
+      ?.to(portfolioRoom(userId, portfolioId))
+      .emit(PORTFOLIO_ERROR_EVENT, error);
   }
 
   @SubscribeMessage(PORTFOLIO_SUBSCRIBE_EVENT)
@@ -337,7 +384,10 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
 
   private mapValuationError(error: unknown): PortfolioSocketError {
     if (error instanceof NotFoundException) {
-      return { code: 'PORTFOLIO_NOT_FOUND', message: NOT_FOUND_MESSAGE };
+      return {
+        code: 'PORTFOLIO_NOT_FOUND',
+        message: PORTFOLIO_NOT_FOUND_MESSAGE,
+      };
     }
     if (error instanceof HttpException) {
       const status = error.getStatus();
@@ -355,7 +405,7 @@ export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {
         };
       }
     }
-    return { code: 'INTERNAL_ERROR', message: INTERNAL_MESSAGE };
+    return { code: 'INTERNAL_ERROR', message: INTERNAL_ERROR_MESSAGE };
   }
 
   private errorAck(

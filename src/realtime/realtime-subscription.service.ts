@@ -107,6 +107,14 @@ interface ActivePortfolio {
   userId: string;
   /** The validated portfolio UUID, also copied from the subscription entry. */
   portfolioId: string;
+  /**
+   * Identifies this activation. Assigned once, when the portfolio first becomes
+   * active, and gone with the entry — so a portfolio that goes inactive and is
+   * subscribed again is a *different* activation carrying a different value.
+   * That is what lets a finishing cycle refuse to deliver its result to the
+   * subscription that replaced the one it computed for.
+   */
+  revision: number;
   /** Socket ids currently actively subscribed. Two sockets = one portfolio. */
   socketIds: Set<string>;
   /** Normalized, deduplicated symbol snapshot (counted once per portfolio). */
@@ -183,6 +191,8 @@ export class RealtimeSubscriptionService {
   private readonly activePortfolios = new Map<PortfolioKey, ActivePortfolio>();
   private readonly symbolPortfolios = new Map<string, Set<PortfolioKey>>();
   private nextAttemptId = 0;
+  /** Hands out each new portfolio activation a distinct revision. */
+  private nextRevision = 0;
 
   constructor(private readonly valuationService: PortfoliosValuationService) {}
 
@@ -454,9 +464,33 @@ export class RealtimeSubscriptionService {
       identities.push({
         userId: portfolio.userId,
         portfolioId: portfolio.portfolioId,
+        revision: portfolio.revision,
       });
     }
     return identities.sort(comparePortfolioIdentities);
+  }
+
+  /**
+   * True only while the portfolio is active *and* still the same activation the
+   * caller was given.
+   *
+   * This is the check a finishing recalculation cycle makes before it publishes:
+   * an unsubscribe (which deletes the activation) and an
+   * unsubscribe-then-resubscribe (which creates a new one) both fail it, so a
+   * result computed for a subscription that has ended is never delivered to the
+   * one that replaced it. A second socket joining the *same* activation does not
+   * change the revision, so it still receives the cycle's result — that
+   * subscription has been live the whole time.
+   */
+  isActivePortfolio(
+    userId: string,
+    portfolioId: string,
+    revision: number,
+  ): boolean {
+    const portfolio = this.activePortfolios.get(
+      makePortfolioKey(userId, portfolioId),
+    );
+    return portfolio !== undefined && portfolio.revision === revision;
   }
 
   // --- Internal lifecycle helpers ---
@@ -530,11 +564,16 @@ export class RealtimeSubscriptionService {
 
     let portfolio = this.activePortfolios.get(key);
     if (!portfolio) {
+      this.nextRevision += 1;
       portfolio = {
         // The registered identity and the validated portfolio UUID — the same
         // pair the key was derived from, so enumeration never has to parse it.
         userId: identity.userId,
         portfolioId: entry.portfolioId,
+        // A brand-new entry is a brand-new activation: the previous one was
+        // deleted when its last socket left, so no result computed under it can
+        // be mistaken for this one.
+        revision: this.nextRevision,
         socketIds: new Set(),
         symbols: new Set(),
       };

@@ -11,6 +11,7 @@ import type { PortfolioValuationDto } from '../portfolios/dto/valuation-response
 import { PortfolioGateway } from './portfolio.gateway';
 import { RealtimeSubscriptionService } from './realtime-subscription.service';
 import {
+  PORTFOLIO_ERROR_EVENT,
   PORTFOLIO_SUBSCRIBE_EVENT,
   PORTFOLIO_VALUATION_EVENT,
   portfolioRoom,
@@ -502,6 +503,68 @@ describe('PortfolioGateway', () => {
       const socket = {} as PortfolioSocket;
       expect(() => gateway.handleDisconnect(socket)).not.toThrow();
       expect(subscriptionService.disconnect).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe('scheduled broadcasts', () => {
+    /**
+     * A Socket.IO server stub recording the one call the gateway makes. `to`
+     * returns the same emitter, mirroring the real chaining.
+     */
+    function makeServer() {
+      const emit = jest.fn();
+      const to = jest.fn(() => ({ emit }));
+      const server = { use: jest.fn(), to };
+      return { server: server as unknown as Server, to, emit };
+    }
+
+    const event = {
+      portfolioId: PORTFOLIO_ID,
+      emittedAt: '2026-01-01T00:00:00.000Z',
+      valuation,
+    };
+
+    it('emits one portfolio:valuation to the portfolio room', () => {
+      const { server, to, emit } = makeServer();
+      gateway.afterInit(server);
+
+      gateway.broadcastValuation(USER_ID, PORTFOLIO_ID, event);
+
+      // One call, addressed to the room derived from the authenticated
+      // identity — Socket.IO fans it out to every socket in that room.
+      expect(to).toHaveBeenCalledTimes(1);
+      expect(to).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith(PORTFOLIO_VALUATION_EVENT, event);
+    });
+
+    it('emits one sanitized portfolio:error to the portfolio room', () => {
+      const { server, to, emit } = makeServer();
+      gateway.afterInit(server);
+      const error = {
+        code: 'MARKET_UNAVAILABLE' as const,
+        message: 'Unable to obtain a portfolio valuation right now.',
+      };
+
+      gateway.broadcastPortfolioError(USER_ID, PORTFOLIO_ID, error);
+
+      expect(to).toHaveBeenCalledTimes(1);
+      expect(to).toHaveBeenCalledWith(portfolioRoom(USER_ID, PORTFOLIO_ID));
+      expect(emit).toHaveBeenCalledTimes(1);
+      expect(emit).toHaveBeenCalledWith(PORTFOLIO_ERROR_EVENT, error);
+    });
+
+    it('is a no-op before the WebSocket layer is initialized', () => {
+      // No afterInit: a broadcast must not throw (and must not invent a server).
+      expect(() =>
+        gateway.broadcastValuation(USER_ID, PORTFOLIO_ID, event),
+      ).not.toThrow();
+      expect(() =>
+        gateway.broadcastPortfolioError(USER_ID, PORTFOLIO_ID, {
+          code: 'INTERNAL_ERROR',
+          message: 'An unexpected error occurred.',
+        }),
+      ).not.toThrow();
     });
   });
 });

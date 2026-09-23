@@ -164,6 +164,18 @@ export interface RealtimePriceRefreshResult {
 export interface ActivePortfolioIdentity {
   userId: string;
   portfolioId: string;
+  /**
+   * The activation this identity belongs to.
+   *
+   * Assigned when a portfolio *becomes* active and destroyed with it, so a
+   * portfolio that goes inactive and is subscribed again gets a new one. It
+   * exists for exactly one purpose: letting a completing recalculation cycle
+   * prove that the portfolio it computed for is still the same activation, so a
+   * result computed before an unsubscribe cannot be delivered to the
+   * subscription that replaced it. Consumers other than the broadcaster ignore
+   * it.
+   */
+  revision: number;
 }
 
 /**
@@ -185,6 +197,8 @@ export interface PortfolioRecalculationSuccess {
   ok: true;
   userId: string;
   portfolioId: string;
+  /** The activation this result was computed for. See `ActivePortfolioIdentity`. */
+  revision: number;
   /** Byte-identical to the REST valuation payload for the same inputs. */
   valuation: PortfolioValuationDto;
 }
@@ -194,6 +208,8 @@ export interface PortfolioRecalculationFailure {
   ok: false;
   userId: string;
   portfolioId: string;
+  /** The activation this result was computed for. See `ActivePortfolioIdentity`. */
+  revision: number;
   code: PortfolioRecalculationFailureCode;
   /**
    * Normalized, deduplicated, sorted symbols this portfolio holds that had no
@@ -225,4 +241,50 @@ export interface RealtimeRecalculationResult {
   failedSymbols: string[];
   /** One entry per portfolio in the cycle's snapshot, sorted by identity. */
   results: PortfolioRecalculationResult[];
+}
+
+/**
+ * The client-facing messages the socket contract already uses. They live here
+ * so the gateway and the scheduler describe the same outcome with the same
+ * words — a scheduled failure must not invent a second vocabulary for a
+ * condition a subscribe already reports.
+ *
+ * Every one is a fixed constant: none is built from an exception, a provider
+ * payload, or a database message.
+ */
+export const PORTFOLIO_NOT_FOUND_MESSAGE = 'Portfolio not found.';
+export const MARKET_UNAVAILABLE_MESSAGE =
+  'Unable to obtain a portfolio valuation right now.';
+export const INTERNAL_ERROR_MESSAGE = 'An unexpected error occurred.';
+
+/**
+ * Translate a cycle's failure classification into the socket contract's error
+ * payload.
+ *
+ * The mapping is deliberately lossy: a client learns only that a portfolio is
+ * gone, that a valuation was unobtainable right now, or that something
+ * unexpected happened — never which symbol failed, which query errored, or what
+ * the provider said. The detailed cause stays server-side, where the
+ * recalculation result already carries it for logging.
+ */
+export function recalculationSocketError(
+  code: PortfolioRecalculationFailureCode,
+): PortfolioSocketError {
+  switch (code) {
+    case 'PORTFOLIO_NOT_FOUND':
+      return {
+        code: 'PORTFOLIO_NOT_FOUND',
+        message: PORTFOLIO_NOT_FOUND_MESSAGE,
+      };
+    case 'MISSING_PRICE':
+    case 'HOLDINGS_UNAVAILABLE':
+      // Same code the subscribe path uses when a valuation cannot be produced
+      // (no market data, provider unavailable, holdings unreadable).
+      return {
+        code: 'MARKET_UNAVAILABLE',
+        message: MARKET_UNAVAILABLE_MESSAGE,
+      };
+    default:
+      return { code: 'INTERNAL_ERROR', message: INTERNAL_ERROR_MESSAGE };
+  }
 }

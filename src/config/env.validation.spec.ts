@@ -95,6 +95,31 @@ describe('validateEnv', () => {
     },
   );
 
+  it.each(['abc', '-5', '0', '5.5', ''])(
+    'throws when REALTIME_REFRESH_INTERVAL_MS is %s (not a positive integer)',
+    (value) => {
+      expect(() =>
+        validateEnv({ ...validConfig, REALTIME_REFRESH_INTERVAL_MS: value }),
+      ).toThrow(/REALTIME_REFRESH_INTERVAL_MS/);
+    },
+  );
+
+  it('accepts an omitted REALTIME_REFRESH_INTERVAL_MS (the scheduler defaults)', () => {
+    const config = { ...validConfig };
+    delete config.REALTIME_REFRESH_INTERVAL_MS;
+
+    expect(() => validateEnv(config)).not.toThrow();
+  });
+
+  it.each(['1', '60000'])(
+    'accepts REALTIME_REFRESH_INTERVAL_MS=%s',
+    (value) => {
+      expect(() =>
+        validateEnv({ ...validConfig, REALTIME_REFRESH_INTERVAL_MS: value }),
+      ).not.toThrow();
+    },
+  );
+
   it.each(['abc', '0', '70000', '-1'])(
     'throws when PORT is %s (not an integer in 1-65535)',
     (value) => {
