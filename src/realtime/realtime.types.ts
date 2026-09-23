@@ -146,3 +146,83 @@ export interface RealtimePriceRefreshResult {
   /** Normalized symbols that could not be priced this cycle, in symbol order. */
   failedSymbols: string[];
 }
+
+/**
+ * Identity of one active portfolio, as the registry knows it.
+ *
+ * Both ids are the authenticated ones captured at subscribe time: `userId` from
+ * the verified token, `portfolioId` from the validated payload. They are
+ * exactly the pair the trusted internal reader requires to prove ownership, so
+ * a recalculation cycle can load a portfolio's holdings without an access token
+ * ever being in play.
+ *
+ * Deliberately carries no socket id, room name, or symbol set: who receives a
+ * result is a transport concern resolved at broadcast time, and the symbols a
+ * cycle must price come from freshly loaded holdings rather than the registry's
+ * snapshot.
+ */
+export interface ActivePortfolioIdentity {
+  userId: string;
+  portfolioId: string;
+}
+
+/**
+ * Why one portfolio could not be recomputed in a cycle.
+ *
+ * A closed, stable vocabulary rather than a carried exception. Results cross
+ * into a future broadcast/logging slice, so they must never expose a raw
+ * exception object, a PostgREST message, a provider payload, or any credential
+ * detail — only one of these four outcomes.
+ */
+export type PortfolioRecalculationFailureCode =
+  | 'PORTFOLIO_NOT_FOUND'
+  | 'HOLDINGS_UNAVAILABLE'
+  | 'MISSING_PRICE'
+  | 'INTERNAL_ERROR';
+
+/** One portfolio successfully recomputed this cycle. */
+export interface PortfolioRecalculationSuccess {
+  ok: true;
+  userId: string;
+  portfolioId: string;
+  /** Byte-identical to the REST valuation payload for the same inputs. */
+  valuation: PortfolioValuationDto;
+}
+
+/** One portfolio that could not be recomputed, isolated from every other. */
+export interface PortfolioRecalculationFailure {
+  ok: false;
+  userId: string;
+  portfolioId: string;
+  code: PortfolioRecalculationFailureCode;
+  /**
+   * Normalized, deduplicated, sorted symbols this portfolio holds that had no
+   * usable price this cycle. Empty unless `code` is `MISSING_PRICE`.
+   */
+  unpricedSymbols: string[];
+}
+
+/**
+ * Per-portfolio outcome of one cycle: exactly one entry per identity in the
+ * cycle's starting snapshot, in that snapshot's order.
+ */
+export type PortfolioRecalculationResult =
+  PortfolioRecalculationSuccess | PortfolioRecalculationFailure;
+
+/**
+ * Outcome of one recalculation cycle.
+ *
+ * Partial failure is the normal shape, not an error path: a portfolio that
+ * could not be recomputed is reported in `results` while every other portfolio's
+ * valuation is still returned. `prices` is the one shared price map every
+ * successful valuation was computed from — created fresh for this cycle and
+ * never retained.
+ */
+export interface RealtimeRecalculationResult {
+  /** Normalized symbol → exact price, for every symbol priced this cycle. */
+  prices: SymbolPriceMap;
+  /** Normalized symbols that could not be priced at all, sorted. */
+  failedSymbols: string[];
+  /** One entry per portfolio in the cycle's snapshot, sorted by identity. */
+  results: PortfolioRecalculationResult[];
+}

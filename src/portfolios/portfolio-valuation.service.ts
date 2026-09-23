@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import Decimal from 'decimal.js';
 import { MarketService } from '../market/market.service';
+import { normalizeSymbol } from '../market/validation/symbol.validation';
 import { SupabaseService } from '../supabase/supabase.service';
 import { mapWithConcurrency, VALUATION_QUOTE_CONCURRENCY } from './concurrency';
 import { toDatabaseHttpException } from './database-errors';
@@ -43,8 +44,10 @@ interface ValuationHoldingRow {
  *     strings are built, and only for calculated money/percentage figures.
  *
  * `getValuation` orchestrates the first two and is the single entry point the
- * REST controller and the realtime gateway both call, unchanged. The third
- * phase is the seam a future realtime poller reuses when it already has prices.
+ * REST controller and the realtime gateway both call, unchanged.
+ * `valueHoldingsWithPrices` is the seam the realtime recalculation cycle uses
+ * when it already holds one shared price per symbol: it reuses the same pure
+ * computation and adds no provider call. `valueHoldings` is unchanged.
  *
  * All financial decimals in the response are JSON strings; `currentPrice` is the
  * exact provider price echoed back canonically, never rounded, so it always
@@ -171,6 +174,60 @@ export class PortfoliosValuationService {
       if (error instanceof HttpException) throw error;
       throw toDatabaseHttpException(error, 'list-holdings');
     }
+  }
+
+  /**
+   * Value already-loaded holdings against prices the caller already holds.
+   *
+   * This is the seam a realtime recalculation cycle uses: one price per unique
+   * symbol is fetched for the whole cycle and then reused by every portfolio
+   * that holds it, so valuing a portfolio must not make provider calls of its
+   * own. Makes no database, network, or provider call at all.
+   *
+   * An empty holding set returns the exact zero valuation, exactly as
+   * `valueHoldings` does — an owned-but-empty portfolio is a valid portfolio,
+   * not a failure.
+   *
+   * All-or-nothing, like `valueHoldings`: a holding whose symbol has no usable
+   * supplied price fails the whole call with the same neutral 422 the provider
+   * failure path raises. Valuing a portfolio over a missing price — by
+   * substituting a zero, or by quietly dropping the line — would publish a
+   * financially incorrect total, which is never acceptable for money.
+   */
+  valueHoldingsWithPrices(
+    portfolioId: string,
+    holdings: readonly ValuationHolding[],
+    prices: ReadonlyMap<string, Decimal>,
+  ): PortfolioValuationDto {
+    return computePortfolioValuation(
+      portfolioId,
+      holdings.map((holding) => ({
+        ...holding,
+        currentPrice: this.requirePrice(prices, holding.symbol),
+      })),
+    );
+  }
+
+  /**
+   * The supplied exact price for one held symbol, or the neutral valuation
+   * error. Looked up by normalized symbol so a stored casing difference can
+   * never miss a price that was fetched for that symbol — the same
+   * normalization the fetch side applies.
+   */
+  private requirePrice(
+    prices: ReadonlyMap<string, Decimal>,
+    symbol: string,
+  ): Decimal {
+    const price = prices.get(normalizeSymbol(symbol));
+    // The map is built from validated provider prices, so this is a guard
+    // against a future caller rather than a live path. A non-positive or
+    // non-finite value is treated exactly like a missing one: never used.
+    if (price === undefined || !price.isFinite() || price.lte(0)) {
+      throw new UnprocessableEntityException(
+        NO_MARKET_DATA.replace('%s', symbol),
+      );
+    }
+    return price;
   }
 
   /**

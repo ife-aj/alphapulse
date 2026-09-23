@@ -9,6 +9,7 @@ import { SupabaseService } from '../supabase/supabase.service';
 import { PortfoliosValuationService } from './portfolio-valuation.service';
 import { VALUATION_QUOTE_CONCURRENCY } from './concurrency';
 import type { ValuationHolding } from './valuation-computation';
+import { computePortfolioValuation } from './valuation-computation';
 
 /** Scripted PostgREST response. */
 type Result = { data: unknown; error: unknown };
@@ -17,9 +18,19 @@ const USER_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const PORTFOLIO_ID = 'bbbbbbbb-bbbb-4bbb-9bbb-bbbbbbbbbbbb';
 const TOKEN = 'token-1';
 
-function buildChain(result: () => Result, calls: { method: string; args: unknown[] }[]) {
+function buildChain(
+  result: () => Result,
+  calls: { method: string; args: unknown[] }[],
+) {
   const chain: Record<string, jest.Mock> = {};
-  for (const method of ['select', 'insert', 'update', 'delete', 'order', 'eq']) {
+  for (const method of [
+    'select',
+    'insert',
+    'update',
+    'delete',
+    'order',
+    'eq',
+  ]) {
     chain[method] = jest.fn((...args: unknown[]) => {
       calls.push({ method, args });
       return chain;
@@ -95,21 +106,28 @@ describe('PortfoliosValuationService', () => {
     const market = { getQuotes: jest.fn() };
     const service = buildService(supabase, market);
 
-    await expect(service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID)).resolves.toEqual(
-      {
-        portfolioId: PORTFOLIO_ID,
-        totalInvestedValue: '0.00',
-        totalCurrentValue: '0.00',
-        totalProfitLoss: '0.00',
-        totalReturnPercentage: '0.00',
-        holdings: [],
-      },
-    );
+    await expect(
+      service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID),
+    ).resolves.toEqual({
+      portfolioId: PORTFOLIO_ID,
+      totalInvestedValue: '0.00',
+      totalCurrentValue: '0.00',
+      totalProfitLoss: '0.00',
+      totalReturnPercentage: '0.00',
+      holdings: [],
+    });
 
     expect(market.getQuotes).not.toHaveBeenCalled();
     // Read-only: only selects happened; the empty portfolio issued no write.
     expect(calls.some((c) => c.method === 'select')).toBe(true);
-    expect(calls.some((c) => c.method === 'insert' || c.method === 'update' || c.method === 'delete')).toBe(false);
+    expect(
+      calls.some(
+        (c) =>
+          c.method === 'insert' ||
+          c.method === 'update' ||
+          c.method === 'delete',
+      ),
+    ).toBe(false);
   });
 
   it('values a single holding from the exact provider price without premature rounding', async () => {
@@ -131,40 +149,38 @@ describe('PortfoliosValuationService', () => {
     };
     const service = buildService(supabase, market);
 
-    await expect(service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID)).resolves.toEqual(
-      {
-        portfolioId: PORTFOLIO_ID,
-        // Exact math: 10 × 182.7465 = 1827.465 → 1827.47 (had the quote been
-        // rounded to cents first, this would read 1827.50).
-        totalInvestedValue: '1000.00',
-        totalCurrentValue: '1827.47',
-        totalProfitLoss: '827.47',
-        totalReturnPercentage: '82.75',
-        holdings: [
-          {
-            symbol: 'AAPL',
-            quantity: '10',
-            averagePurchasePrice: '100',
-            // The displayed price is the exact provider value — never rounded to
-            // cents — so it agrees with the calculated currentValue.
-            currentPrice: '182.7465',
-            investedValue: '1000.00',
-            currentValue: '1827.47',
-            profitLoss: '827.47',
-            returnPercentage: '82.75',
-          },
-        ],
-      },
-    );
+    await expect(
+      service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID),
+    ).resolves.toEqual({
+      portfolioId: PORTFOLIO_ID,
+      // Exact math: 10 × 182.7465 = 1827.465 → 1827.47 (had the quote been
+      // rounded to cents first, this would read 1827.50).
+      totalInvestedValue: '1000.00',
+      totalCurrentValue: '1827.47',
+      totalProfitLoss: '827.47',
+      totalReturnPercentage: '82.75',
+      holdings: [
+        {
+          symbol: 'AAPL',
+          quantity: '10',
+          averagePurchasePrice: '100',
+          // The displayed price is the exact provider value — never rounded to
+          // cents — so it agrees with the calculated currentValue.
+          currentPrice: '182.7465',
+          investedValue: '1000.00',
+          currentValue: '1827.47',
+          profitLoss: '827.47',
+          returnPercentage: '82.75',
+        },
+      ],
+    });
 
     expect(market.getQuotes).toHaveBeenCalledTimes(1);
     expect(market.getQuotes).toHaveBeenCalledWith(['AAPL']);
     expect(
       calls.some(
         (c) =>
-          c.method === 'eq' &&
-          c.args[0] === 'user_id' &&
-          c.args[1] === USER_ID,
+          c.method === 'eq' && c.args[0] === 'user_id' && c.args[1] === USER_ID,
       ),
     ).toBe(true);
     expect(
@@ -177,7 +193,9 @@ describe('PortfoliosValuationService', () => {
     ).toBe(true);
     // The holdings read is intentionally narrow (no id/timestamps fetched).
     const holdingsSelect = calls.find(
-      (c) => c.method === 'select' && c.args[0] === 'symbol, quantity, average_purchase_price',
+      (c) =>
+        c.method === 'select' &&
+        c.args[0] === 'symbol, quantity, average_purchase_price',
     );
     expect(holdingsSelect).toBeDefined();
   });
@@ -186,9 +204,7 @@ describe('PortfoliosValuationService', () => {
     const { supabase } = buildSupabase([
       { data: { id: PORTFOLIO_ID }, error: null },
       {
-        data: [
-          { symbol: 'AAPL', quantity: 12.5, average_purchase_price: 150 },
-        ],
+        data: [{ symbol: 'AAPL', quantity: 12.5, average_purchase_price: 150 }],
         error: null,
       },
     ]);
@@ -197,30 +213,30 @@ describe('PortfoliosValuationService', () => {
     };
     const service = buildService(supabase, market);
 
-    await expect(service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID)).resolves.toEqual(
-      {
-        portfolioId: PORTFOLIO_ID,
-        totalInvestedValue: '1875.00',
-        totalCurrentValue: '2284.33',
-        totalProfitLoss: '409.33',
-        totalReturnPercentage: '21.83',
-        holdings: [
-          {
-            symbol: 'AAPL',
-            quantity: '12.5',
-            averagePurchasePrice: '150',
-            // Exact, unrounded provider price — NOT forced to two decimals.
-            currentPrice: '182.7465',
-            investedValue: '1875.00',
-            // Calculated from the exact price (12.5 × 182.7465 = 2284.33125),
-            // rounded only at serialization to two decimals.
-            currentValue: '2284.33',
-            profitLoss: '409.33',
-            returnPercentage: '21.83',
-          },
-        ],
-      },
-    );
+    await expect(
+      service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID),
+    ).resolves.toEqual({
+      portfolioId: PORTFOLIO_ID,
+      totalInvestedValue: '1875.00',
+      totalCurrentValue: '2284.33',
+      totalProfitLoss: '409.33',
+      totalReturnPercentage: '21.83',
+      holdings: [
+        {
+          symbol: 'AAPL',
+          quantity: '12.5',
+          averagePurchasePrice: '150',
+          // Exact, unrounded provider price — NOT forced to two decimals.
+          currentPrice: '182.7465',
+          investedValue: '1875.00',
+          // Calculated from the exact price (12.5 × 182.7465 = 2284.33125),
+          // rounded only at serialization to two decimals.
+          currentValue: '2284.33',
+          profitLoss: '409.33',
+          returnPercentage: '21.83',
+        },
+      ],
+    });
   });
 
   it('aggregates several holdings, rounding totals once from exact sums', async () => {
@@ -235,50 +251,59 @@ describe('PortfoliosValuationService', () => {
       },
     ]);
     const market = {
-      getQuotes: jest.fn().mockImplementation((symbols: string[]) =>
-        Promise.resolve([quote(symbols[0] === 'AAPL' ? 182.75 : 70)]),
-      ),
+      getQuotes: jest
+        .fn()
+        .mockImplementation((symbols: string[]) =>
+          Promise.resolve([quote(symbols[0] === 'AAPL' ? 182.75 : 70)]),
+        ),
     };
     const service = buildService(supabase, market);
 
-    await expect(service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID)).resolves.toEqual(
-      {
-        portfolioId: PORTFOLIO_ID,
-        totalInvestedValue: '2144.69',
-        totalCurrentValue: '2564.38',
-        totalProfitLoss: '419.68',
-        totalReturnPercentage: '19.57',
-        holdings: [
-          {
-            symbol: 'AAPL',
-            quantity: '12.5',
-            averagePurchasePrice: '152.3755',
-            currentPrice: '182.75',
-            investedValue: '1904.69',
-            currentValue: '2284.38',
-            profitLoss: '379.68',
-            returnPercentage: '19.93',
-          },
-          {
-            symbol: 'MSFT',
-            quantity: '4',
-            averagePurchasePrice: '60',
-            // Canonical form: the exact provider price, no forced cents.
-            currentPrice: '70',
-            investedValue: '240.00',
-            currentValue: '280.00',
-            profitLoss: '40.00',
-            returnPercentage: '16.67',
-          },
-        ],
-      },
-    );
+    await expect(
+      service.getValuation(USER_ID, TOKEN, PORTFOLIO_ID),
+    ).resolves.toEqual({
+      portfolioId: PORTFOLIO_ID,
+      totalInvestedValue: '2144.69',
+      totalCurrentValue: '2564.38',
+      totalProfitLoss: '419.68',
+      totalReturnPercentage: '19.57',
+      holdings: [
+        {
+          symbol: 'AAPL',
+          quantity: '12.5',
+          averagePurchasePrice: '152.3755',
+          currentPrice: '182.75',
+          investedValue: '1904.69',
+          currentValue: '2284.38',
+          profitLoss: '379.68',
+          returnPercentage: '19.93',
+        },
+        {
+          symbol: 'MSFT',
+          quantity: '4',
+          averagePurchasePrice: '60',
+          // Canonical form: the exact provider price, no forced cents.
+          currentPrice: '70',
+          investedValue: '240.00',
+          currentValue: '280.00',
+          profitLoss: '40.00',
+          returnPercentage: '16.67',
+        },
+      ],
+    });
 
     // One bounded request per symbol, no writes.
     expect(market.getQuotes).toHaveBeenCalledTimes(2);
     expect(market.getQuotes).toHaveBeenCalledWith(['AAPL']);
     expect(market.getQuotes).toHaveBeenCalledWith(['MSFT']);
-    expect(calls.some((c) => c.method === 'insert' || c.method === 'update' || c.method === 'delete')).toBe(false);
+    expect(
+      calls.some(
+        (c) =>
+          c.method === 'insert' ||
+          c.method === 'update' ||
+          c.method === 'delete',
+      ),
+    ).toBe(false);
   });
 
   it('translates an unknown-symbol provider 404 into a 422 valuation error', async () => {
@@ -290,7 +315,9 @@ describe('PortfoliosValuationService', () => {
       },
     ]);
     const market = {
-      getQuotes: jest.fn().mockRejectedValue(new NotFoundException('Unknown symbol "ZZZZ"')),
+      getQuotes: jest
+        .fn()
+        .mockRejectedValue(new NotFoundException('Unknown symbol "ZZZZ"')),
     };
     const service = buildService(supabase, market);
 
@@ -299,7 +326,9 @@ describe('PortfoliosValuationService', () => {
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(UnprocessableEntityException);
     expect((error as UnprocessableEntityException).getStatus()).toBe(422);
-    expect(JSON.stringify((error as UnprocessableEntityException).getResponse())).toContain('ZZZZ');
+    expect(
+      JSON.stringify((error as UnprocessableEntityException).getResponse()),
+    ).toContain('ZZZZ');
   });
 
   it('rejects a non-positive or non-finite provider price as unprocessable', async () => {
@@ -333,7 +362,11 @@ describe('PortfoliosValuationService', () => {
     const market = {
       getQuotes: jest
         .fn()
-        .mockRejectedValue(new ServiceUnavailableException('Market data is temporarily unavailable.')),
+        .mockRejectedValue(
+          new ServiceUnavailableException(
+            'Market data is temporarily unavailable.',
+          ),
+        ),
     };
     const service = buildService(supabase, market);
 
@@ -661,5 +694,185 @@ describe('PortfoliosValuationService.valueHoldings', () => {
       .catch((e: unknown) => e);
     expect(error).toBeInstanceOf(UnprocessableEntityException);
     expect((error as UnprocessableEntityException).getStatus()).toBe(422);
+  });
+
+  describe('valueHoldingsWithPrices', () => {
+    function held(
+      symbol: string,
+      quantity: string,
+      averagePurchasePrice: string,
+    ): ValuationHolding {
+      return {
+        symbol,
+        quantity: new Decimal(quantity),
+        averagePurchasePrice: new Decimal(averagePurchasePrice),
+      };
+    }
+
+    function prices(bySymbol: Record<string, string>): Map<string, Decimal> {
+      return new Map(
+        Object.entries(bySymbol).map(([symbol, price]) => [
+          symbol,
+          new Decimal(price),
+        ]),
+      );
+    }
+
+    /** A service whose provider stub must never be reached on this path. */
+    function makeService() {
+      const market = { getQuotes: jest.fn() };
+      return {
+        market,
+        service: buildService(buildSupabase([]).supabase, market),
+      };
+    }
+
+    it('values from the supplied prices without any provider call', () => {
+      const { market, service } = makeService();
+
+      const valuation = service.valueHoldingsWithPrices(
+        PORTFOLIO_ID,
+        [held('AAPL', '10', '100')],
+        prices({ AAPL: '150' }),
+      );
+
+      expect(market.getQuotes).not.toHaveBeenCalled();
+      expect(valuation).toEqual({
+        portfolioId: PORTFOLIO_ID,
+        totalInvestedValue: '1000.00',
+        totalCurrentValue: '1500.00',
+        totalProfitLoss: '500.00',
+        totalReturnPercentage: '50.00',
+        holdings: [
+          {
+            symbol: 'AAPL',
+            quantity: '10',
+            averagePurchasePrice: '100',
+            currentPrice: '150',
+            investedValue: '1000.00',
+            currentValue: '1500.00',
+            profitLoss: '500.00',
+            returnPercentage: '50.00',
+          },
+        ],
+      });
+    });
+
+    it('produces exactly what the shared pure computation produces', () => {
+      const { service } = makeService();
+      const holdings = [held('AAPL', '10', '100')];
+
+      // The seam adds a price source, not a second valuation contract: the
+      // output is the same `computePortfolioValuation` result the REST path
+      // returns for the same price.
+      const fromPrices = service.valueHoldingsWithPrices(
+        PORTFOLIO_ID,
+        holdings,
+        prices({ AAPL: '150' }),
+      );
+      const expected = computePortfolioValuation(PORTFOLIO_ID, [
+        { ...holdings[0], currentPrice: new Decimal('150') },
+      ]);
+
+      expect(fromPrices).toEqual(expected);
+    });
+
+    it('returns the exact zero valuation for an empty portfolio', () => {
+      const { market, service } = makeService();
+
+      const valuation = service.valueHoldingsWithPrices(
+        PORTFOLIO_ID,
+        [],
+        prices({}),
+      );
+
+      expect(valuation).toEqual({
+        portfolioId: PORTFOLIO_ID,
+        totalInvestedValue: '0.00',
+        totalCurrentValue: '0.00',
+        totalProfitLoss: '0.00',
+        totalReturnPercentage: '0.00',
+        holdings: [],
+      });
+      expect(market.getQuotes).not.toHaveBeenCalled();
+    });
+
+    it('matches a stored symbol whose casing differs from the price key', () => {
+      const { service } = makeService();
+
+      const valuation = service.valueHoldingsWithPrices(
+        PORTFOLIO_ID,
+        [held('aapl', '10', '100')],
+        prices({ AAPL: '150' }),
+      );
+
+      expect(valuation.holdings[0].currentPrice).toBe('150');
+      expect(valuation.totalCurrentValue).toBe('1500.00');
+    });
+
+    it('refuses to value over a missing price rather than substituting a zero', () => {
+      const { service } = makeService();
+
+      const error = (() => {
+        try {
+          service.valueHoldingsWithPrices(
+            PORTFOLIO_ID,
+            [held('AAPL', '10', '100'), held('TSLA', '2', '200')],
+            prices({ AAPL: '150' }),
+          );
+          return null;
+        } catch (thrown: unknown) {
+          return thrown;
+        }
+      })();
+
+      // A total omitting TSLA would be silently wrong, so the whole call fails.
+      expect(error).toBeInstanceOf(UnprocessableEntityException);
+      expect((error as UnprocessableEntityException).getStatus()).toBe(422);
+      expect((error as UnprocessableEntityException).message).toContain('TSLA');
+    });
+
+    it.each([
+      ['zero', '0'],
+      ['negative', '-1'],
+    ])('treats a %s supplied price as missing', (_label, price) => {
+      const { service } = makeService();
+
+      expect(() =>
+        service.valueHoldingsWithPrices(
+          PORTFOLIO_ID,
+          [held('AAPL', '10', '100')],
+          prices({ AAPL: price }),
+        ),
+      ).toThrow(UnprocessableEntityException);
+    });
+
+    it('does not mutate the holdings or the price map it was given', () => {
+      const { service } = makeService();
+      const holdings = [held('AAPL', '10', '100')];
+      const supplied = prices({ AAPL: '150' });
+
+      service.valueHoldingsWithPrices(PORTFOLIO_ID, holdings, supplied);
+
+      expect(supplied.size).toBe(1);
+      expect(holdings[0]).not.toHaveProperty('currentPrice');
+    });
+
+    it('prices a symbol held twice from the one supplied price', () => {
+      const { service } = makeService();
+
+      const valuation = service.valueHoldingsWithPrices(
+        PORTFOLIO_ID,
+        [held('AAPL', '1', '100'), held('AAPL', '2', '100')],
+        prices({ AAPL: '150' }),
+      );
+
+      // Both lines are valued by position, each reusing the cycle's one price.
+      expect(valuation.holdings.map((line) => line.currentValue)).toEqual([
+        '150.00',
+        '300.00',
+      ]);
+      expect(valuation.totalCurrentValue).toBe('450.00');
+    });
   });
 });

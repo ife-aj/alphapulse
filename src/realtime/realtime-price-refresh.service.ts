@@ -3,6 +3,7 @@ import Decimal from 'decimal.js';
 import { MarketService } from '../market/market.service';
 import { normalizeSymbol } from '../market/validation/symbol.validation';
 import { RealtimeSubscriptionService } from './realtime-subscription.service';
+import { settleWithConcurrency } from './settle-concurrency';
 import type {
   RealtimePriceRefreshResult,
   SymbolPriceMap,
@@ -55,7 +56,9 @@ function normalizeUniqueSorted(symbols: readonly string[]): string[] {
  * It prices symbols and nothing else. It does not load holdings, recompute a
  * portfolio, touch the registry, or emit anything — the registry is read once,
  * for its symbol snapshot, and a registry change made while a cycle is running
- * belongs to the *next* cycle. No timer drives it yet; callers invoke `refresh()`.
+ * belongs to the *next* cycle. No timer drives it yet; callers invoke
+ * `refresh()` (registry symbols) or `priceSymbols(symbols)` (an explicit set,
+ * as the recalculation coordinator uses).
  *
  * Partial failure is the result shape, not an error path. One symbol the
  * provider cannot price never discards the prices that did arrive: the cycle
@@ -90,6 +93,43 @@ export class RealtimePriceRefreshService {
    * around it; declaring this `async` would silently break that identity.
    */
   refresh(): Promise<RealtimePriceRefreshResult> {
+    return this.coalesce(() =>
+      this.priceSymbols(this.registry.getActiveSymbols()),
+    );
+  }
+
+  /**
+   * Price an explicit, caller-supplied symbol set.
+   *
+   * The same cycle `refresh()` runs — defensively normalize/dedupe/sort, fetch
+   * each unique symbol exactly once under the shared concurrency bound, isolate
+   * per-symbol failure, convert once to `Decimal` — over symbols the caller
+   * already knows. A recalculation cycle uses this, because the symbols it must
+   * price are derived from freshly loaded holdings, not from the registry's
+   * snapshot: a holding added over REST after a socket subscribed is in the
+   * database but not yet in the registry.
+   *
+   * Deliberately NOT coalesced. `refresh()` may coalesce because every caller
+   * wants the same set — the registry's current symbols; here two callers could
+   * legitimately want different sets, and handing one the other's prices would
+   * be silently wrong. Callers that need overlap protection coalesce their own
+   * unit of work (the recalculation coordinator coalesces the whole cycle).
+   */
+  priceSymbols(
+    symbols: readonly string[],
+  ): Promise<RealtimePriceRefreshResult> {
+    return this.runCycle(symbols);
+  }
+
+  /**
+   * Run one cycle, sharing an already-running one with concurrent callers so
+   * overlapping triggers can never produce duplicate provider requests. The
+   * stored promise is returned directly, so coalesced callers receive the
+   * identical object rather than a fresh wrapper around it.
+   */
+  private coalesce(
+    start: () => Promise<RealtimePriceRefreshResult>,
+  ): Promise<RealtimePriceRefreshResult> {
     if (this.inFlight !== null) {
       return this.inFlight;
     }
@@ -97,20 +137,23 @@ export class RealtimePriceRefreshService {
     // The guard clears as soon as the cycle settles — success, partial failure,
     // or all-failure alike — so a later call starts a fresh cycle. Clearing
     // inside `finally` is what makes the service self-healing after a bad cycle.
-    const cycle = this.runCycle().finally(() => {
+    const cycle = start().finally(() => {
       this.inFlight = null;
     });
     this.inFlight = cycle;
     return cycle;
   }
 
-  private async runCycle(): Promise<RealtimePriceRefreshResult> {
-    // Snapshot once, at the start of the cycle. `getActiveSymbols` already hands
-    // back a fresh array, so a subscription made while this cycle runs cannot
-    // mutate the set being fetched here — it is picked up by the next cycle.
-    const symbols = normalizeUniqueSorted(this.registry.getActiveSymbols());
+  private async runCycle(
+    requestedSymbols: readonly string[],
+  ): Promise<RealtimePriceRefreshResult> {
+    // The caller's list is snapshotted synchronously (callers pass a fresh array
+    // — `getActiveSymbols` for the registry path), so a subscription made while
+    // this cycle runs cannot mutate the set being fetched here; it is picked up
+    // by the next cycle.
+    const symbols = normalizeUniqueSorted(requestedSymbols);
 
-    const settled = await this.settleWithConcurrency(
+    const settled = await settleWithConcurrency(
       symbols,
       REFRESH_QUOTE_CONCURRENCY,
       (symbol) => this.fetchPrice(symbol),
@@ -178,53 +221,6 @@ export class RealtimePriceRefreshService {
     // Converted exactly once, here at the market boundary, and reused by every
     // later phase — never re-derived from a rounded or re-parsed value.
     return new Decimal(price);
-  }
-
-  /**
-   * Bounded-concurrency *settle*: at most `limit` mappers in flight, input order
-   * preserved, and a rejection recorded as `rejected` instead of failing the
-   * whole batch.
-   *
-   * Deliberately separate from `portfolios/concurrency.ts`, whose
-   * `mapWithConcurrency` fails fast because a REST valuation is all-or-nothing.
-   * A refresh cycle is the opposite contract — one dead symbol must not discard
-   * the prices that succeeded — so the two must not share an implementation.
-   * Workers still drain every item after a failure.
-   */
-  private async settleWithConcurrency<T, R>(
-    items: readonly T[],
-    limit: number,
-    mapper: (item: T, index: number) => Promise<R>,
-  ): Promise<PromiseSettledResult<R>[]> {
-    const settled = new Array<PromiseSettledResult<R>>(items.length);
-    if (items.length === 0) {
-      return settled;
-    }
-
-    let nextIndex = 0;
-
-    const worker = async (): Promise<void> => {
-      for (;;) {
-        const index = nextIndex;
-        nextIndex += 1;
-        if (index >= items.length) {
-          return;
-        }
-        try {
-          settled[index] = {
-            status: 'fulfilled',
-            value: await mapper(items[index], index),
-          };
-        } catch (reason) {
-          settled[index] = { status: 'rejected', reason };
-        }
-      }
-    };
-
-    const workerCount = Math.min(limit, items.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
-
-    return settled;
   }
 
   /**

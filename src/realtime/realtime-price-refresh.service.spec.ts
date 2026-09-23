@@ -470,4 +470,96 @@ describe('RealtimePriceRefreshService', () => {
       expect(next.failedSymbols).toEqual([]);
     });
   });
+
+  describe('explicit symbol sets', () => {
+    it('prices a caller-supplied set without consulting the registry', async () => {
+      const registry = makeRegistry([TSLA]);
+      const market = makeMarket();
+      const { service } = makeService(registry, market);
+      stubPrices(market);
+
+      const result = await service.priceSymbols([AAPL, MSFT]);
+
+      // The registry's snapshot is irrelevant to an explicit set: a symbol it
+      // has never heard of is priced, and one it holds is not.
+      expect(registry.getActiveSymbols).not.toHaveBeenCalled();
+      expect(requestedSymbols(market)).toEqual([AAPL, MSFT]);
+      expect([...result.prices.keys()]).toEqual([AAPL, MSFT]);
+    });
+
+    it('normalizes, deduplicates, and sorts the caller’s list', async () => {
+      const { market, service } = makeService();
+      stubPrices(market);
+
+      const result = await service.priceSymbols([
+        ` ${TSLA} `,
+        'aapl',
+        AAPL,
+        TSLA,
+        '',
+      ]);
+
+      expect(requestedSymbols(market)).toEqual([AAPL, TSLA]);
+      expect([...result.prices.keys()]).toEqual([AAPL, TSLA]);
+    });
+
+    it('keeps the prices that succeeded when one symbol fails', async () => {
+      const { market, service } = makeService();
+      stubPerSymbol(market, {
+        [AAPL]: [quote(AAPL, 100)],
+        [MSFT]: new ServiceUnavailableException('provider down'),
+      });
+
+      const result = await service.priceSymbols([AAPL, MSFT]);
+
+      expect(result.prices.get(AAPL)?.toString()).toBe('100');
+      expect(result.failedSymbols).toEqual([MSFT]);
+    });
+
+    it('does not coalesce two explicit sets together', async () => {
+      const { market, service } = makeService();
+      const gates = new Map<string, ReturnType<typeof deferred<Quote[]>>>();
+      market.getQuotes.mockImplementation((requested: string[]) => {
+        const gate = deferred<Quote[]>();
+        gates.set(requested[0], gate);
+        return gate.promise;
+      });
+
+      const first = service.priceSymbols([AAPL]);
+      const second = service.priceSymbols([MSFT]);
+      await flush();
+
+      // Handing one caller the other's prices would be silently wrong, so the
+      // two sets run as two independent cycles.
+      expect(second).not.toBe(first);
+      expect([...gates.keys()]).toEqual([AAPL, MSFT]);
+
+      gates.get(AAPL)?.resolve([quote(AAPL, 100)]);
+      gates.get(MSFT)?.resolve([quote(MSFT, 200)]);
+      const [firstResult, secondResult] = await Promise.all([first, second]);
+
+      expect([...firstResult.prices.keys()]).toEqual([AAPL]);
+      expect([...secondResult.prices.keys()]).toEqual([MSFT]);
+    });
+
+    it('runs an explicit set independently of an in-flight registry cycle', async () => {
+      const registry = makeRegistry([AAPL]);
+      const market = makeMarket();
+      const { service } = makeService(registry, market);
+
+      const gate = deferred<Quote[]>();
+      market.getQuotes.mockReturnValueOnce(gate.promise);
+
+      const registryCycle = service.refresh();
+      await flush();
+
+      market.getQuotes.mockResolvedValueOnce([quote(MSFT, 200)]);
+      const explicit = await service.priceSymbols([MSFT]);
+      expect([...explicit.prices.keys()]).toEqual([MSFT]);
+
+      gate.resolve([quote(AAPL, 100)]);
+      const cycled = await registryCycle;
+      expect([...cycled.prices.keys()]).toEqual([AAPL]);
+    });
+  });
 });

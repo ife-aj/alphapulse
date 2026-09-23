@@ -3,6 +3,7 @@ import { normalizeSymbol } from '../market/validation/symbol.validation';
 import type { PortfolioValuationDto } from '../portfolios/dto/valuation-response.dto';
 import { PortfoliosValuationService } from '../portfolios/portfolio-valuation.service';
 import type { ValuationHolding } from '../portfolios/valuation-computation';
+import type { ActivePortfolioIdentity } from './realtime.types';
 
 /**
  * Neutral message for a socket that presents a user id other than the one it
@@ -51,6 +52,25 @@ function makePortfolioKey(userId: string, portfolioId: string): PortfolioKey {
 /** A live subscription on one socket: pending (reserved, unresolved) or active. */
 type SubscriptionState = 'PENDING' | 'ACTIVE';
 
+/**
+ * Deterministic ordering for active-portfolio snapshots: user id, then
+ * portfolio id. Deliberately compared by code unit rather than
+ * `localeCompare`, whose ordering depends on the runtime's locale and would
+ * make cycle output environment-dependent.
+ */
+function comparePortfolioIdentities(
+  a: ActivePortfolioIdentity,
+  b: ActivePortfolioIdentity,
+): number {
+  if (a.userId !== b.userId) {
+    return a.userId < b.userId ? -1 : 1;
+  }
+  if (a.portfolioId !== b.portfolioId) {
+    return a.portfolioId < b.portfolioId ? -1 : 1;
+  }
+  return 0;
+}
+
 /** The per-(socket, portfolio) entry the state machine lives on. */
 interface SocketSubscription {
   /** The validated portfolio UUID (kept so snapshots need not decode keys). */
@@ -73,10 +93,20 @@ interface SocketIdentity {
 
 /**
  * An active portfolio: one portfolio (unique per authenticated user) that at
- * least one socket is actively subscribed to. Stores only the symbol snapshot a
- * future poller needs — never holdings Decimals, valuations, or access tokens.
+ * least one socket is actively subscribed to. Stores only the identity and the
+ * symbol snapshot a future poller needs — never holdings Decimals, valuations,
+ * or access tokens.
  */
 interface ActivePortfolio {
+  /**
+   * The authenticated identity ownership is proven against, copied from the
+   * socket entry at activation. Held here (rather than decoded from the
+   * portfolio key) so enumeration needs no key parser and `makePortfolioKey`
+   * stays the only place a key is ever built.
+   */
+  userId: string;
+  /** The validated portfolio UUID, also copied from the subscription entry. */
+  portfolioId: string;
   /** Socket ids currently actively subscribed. Two sockets = one portfolio. */
   socketIds: Set<string>;
   /** Normalized, deduplicated symbol snapshot (counted once per portfolio). */
@@ -398,6 +428,37 @@ export class RealtimeSubscriptionService {
     return [...this.symbolPortfolios.keys()].sort();
   }
 
+  /**
+   * Every active portfolio's authenticated identity — the starting snapshot of
+   * one recalculation cycle.
+   *
+   * A fresh array of fresh objects: a subscription change made while a cycle
+   * runs cannot mutate the set being processed, so that change belongs to the
+   * next cycle. One entry per active portfolio regardless of how many sockets
+   * are watching it, and portfolios whose only subscriptions are still pending
+   * contribute nothing.
+   *
+   * The identity is read off the entry, never decoded from the portfolio key,
+   * so `makePortfolioKey` remains the single construction point and there is no
+   * parser that could drift from its encoding.
+   *
+   * Deliberately excludes socket ids, room names, and symbol snapshots: who
+   * receives a result is a transport concern, and the symbols to price come
+   * from freshly loaded holdings. Sorted by identity, because the map's own
+   * insertion order follows subscription history and would otherwise leak into
+   * cycle output.
+   */
+  getActivePortfolioIdentities(): ActivePortfolioIdentity[] {
+    const identities: ActivePortfolioIdentity[] = [];
+    for (const portfolio of this.activePortfolios.values()) {
+      identities.push({
+        userId: portfolio.userId,
+        portfolioId: portfolio.portfolioId,
+      });
+    }
+    return identities.sort(comparePortfolioIdentities);
+  }
+
   // --- Internal lifecycle helpers ---
 
   /**
@@ -456,15 +517,27 @@ export class RealtimeSubscriptionService {
     attemptId: SubscriptionAttemptId,
     holdings: readonly ValuationHolding[],
   ): void {
-    const entry = this.sockets.get(socketId)?.subscriptions.get(key);
-    if (entry === undefined || entry.attemptId !== attemptId) {
+    const identity = this.sockets.get(socketId);
+    const entry = identity?.subscriptions.get(key);
+    if (
+      identity === undefined ||
+      entry === undefined ||
+      entry.attemptId !== attemptId
+    ) {
       return; // defensive: single-threaded, but never commit an obsolete attempt
     }
     entry.state = 'ACTIVE';
 
     let portfolio = this.activePortfolios.get(key);
     if (!portfolio) {
-      portfolio = { socketIds: new Set(), symbols: new Set() };
+      portfolio = {
+        // The registered identity and the validated portfolio UUID — the same
+        // pair the key was derived from, so enumeration never has to parse it.
+        userId: identity.userId,
+        portfolioId: entry.portfolioId,
+        socketIds: new Set(),
+        symbols: new Set(),
+      };
       this.activePortfolios.set(key, portfolio);
     }
     portfolio.socketIds.add(socketId);

@@ -1049,6 +1049,96 @@ describe('RealtimeSubscriptionService', () => {
     });
   });
 
+  describe('active portfolio identity inspection', () => {
+    it('returns nothing for an idle registry', () => {
+      const { service } = makeService();
+      expect(service.getActivePortfolioIdentities()).toEqual([]);
+    });
+
+    it('returns one authenticated identity per active portfolio, sorted', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, ['AAPL']);
+
+      // Subscribed in the reverse of the order the snapshot must report.
+      await subscribe(service, SOCKET_A, OTHER_USER_ID, PORTFOLIO_2);
+      await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_1);
+
+      expect(service.getActivePortfolioIdentities()).toEqual([
+        { userId: USER_ID, portfolioId: PORTFOLIO_1 },
+        { userId: OTHER_USER_ID, portfolioId: PORTFOLIO_2 },
+      ]);
+    });
+
+    it('lists a portfolio once no matter how many sockets watch it', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, ['AAPL']);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_1);
+
+      expect(service.getActivePortfolioIdentities()).toEqual([
+        { userId: USER_ID, portfolioId: PORTFOLIO_1 },
+      ]);
+    });
+
+    it('omits portfolios that only ever had a pending attempt', async () => {
+      const { valuation, service } = makeService();
+      const gate = deferred<ValuationHolding[]>();
+      valuation.getValuationHoldings.mockReturnValueOnce(gate.promise);
+      valuation.valueHoldings.mockResolvedValue(valuationFor(PORTFOLIO_1));
+
+      // Reserved PENDING and left unresolved: never activated, so not active.
+      const pending = subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      await flush();
+      expect(service.getActivePortfolioIdentities()).toEqual([]);
+
+      gate.resolve(holdings('AAPL'));
+      await pending;
+      expect(service.getActivePortfolioIdentities()).toEqual([
+        { userId: USER_ID, portfolioId: PORTFOLIO_1 },
+      ]);
+    });
+
+    it('drops a portfolio as soon as its last subscription goes', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, ['AAPL']);
+
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+      await subscribe(service, SOCKET_B, USER_ID, PORTFOLIO_2);
+      service.unsubscribe(SOCKET_A, USER_ID, PORTFOLIO_1);
+      expect(service.getActivePortfolioIdentities()).toEqual([
+        { userId: USER_ID, portfolioId: PORTFOLIO_2 },
+      ]);
+
+      service.disconnect(SOCKET_B);
+      expect(service.getActivePortfolioIdentities()).toEqual([]);
+    });
+
+    it('returns fresh objects, and never a socket id, symbol set, or key', async () => {
+      const { valuation, service } = makeService();
+      stubHoldings(valuation, ['AAPL']);
+      await subscribe(service, SOCKET_A, USER_ID, PORTFOLIO_1);
+
+      const snapshot = service.getActivePortfolioIdentities();
+      expect(Object.keys(snapshot[0]).sort()).toEqual([
+        'portfolioId',
+        'userId',
+      ]);
+      // The internal portfolio key encoding never escapes.
+      expect(snapshot[0]).not.toHaveProperty('0');
+      expect(JSON.stringify(snapshot)).not.toContain(SOCKET_A);
+
+      // Mutating a returned copy must not corrupt the registry.
+      snapshot[0].userId = 'HACK';
+      snapshot.push({ userId: 'HACK', portfolioId: 'HACK' });
+      snapshot.length = 0;
+
+      expect(service.getActivePortfolioIdentities()).toEqual([
+        { userId: USER_ID, portfolioId: PORTFOLIO_1 },
+      ]);
+    });
+  });
+
   describe('inspection boundaries', () => {
     it('never leaks internal mutable maps or sets through inspection methods', async () => {
       const { valuation, service } = makeService();

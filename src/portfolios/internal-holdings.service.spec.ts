@@ -514,13 +514,14 @@ describe('privileged-read surface', () => {
     ]);
   });
 
-  it('registers InternalHoldingsService in PortfoliosModule without exporting it', () => {
+  it('registers InternalHoldingsService in PortfoliosModule and exports it for Slice 3B.2', () => {
     const providers = Reflect.getMetadata('providers', PortfoliosModule) ?? [];
     const exported = Reflect.getMetadata('exports', PortfoliosModule) ?? [];
 
     expect(providers).toContain(InternalHoldingsService);
-    // Not exported until Slice 3B.2 introduces its consumer.
-    expect(exported).not.toContain(InternalHoldingsService);
+    // Exported for its one consumer, the realtime recalculation coordinator —
+    // and only as a service returning plain holdings.
+    expect(exported).toContain(InternalHoldingsService);
   });
 
   it('is not injected by the portfolios controller', () => {
