@@ -67,9 +67,7 @@ const VALIDATION_MESSAGE = 'portfolioId must be a valid UUID.';
  * portfolios), and two sockets on the same portfolio each receive their own
  * initial valuation.
  *
- * No CORS is configured here, consistent with the HTTP API, which enables no
- * CORS either (see `src/main.ts`). Cross-origin browser clients are out of
- * scope; same-origin and non-browser clients connect fine.
+ * Production browser origins are configured by the adapter in main.ts.
  */
 @WebSocketGateway()
 export class PortfolioGateway implements OnGatewayInit, OnGatewayDisconnect {

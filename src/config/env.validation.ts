@@ -1,3 +1,5 @@
+import { parseAllowedOrigins } from './cors';
+
 /**
  * Startup validation for the environment AlphaPulse runs under.
  *
@@ -15,6 +17,13 @@ export function validateEnv(
   config: Record<string, unknown>,
 ): Record<string, unknown> {
   const errors: string[] = [];
+  try {
+    parseAllowedOrigins(config['CORS_ORIGINS']);
+  } catch {
+    errors.push(
+      'CORS_ORIGINS must contain exact http(s) origins without paths or trailing slashes',
+    );
+  }
 
   // API keys are useless empty; fail fast rather than emit 401s at request time.
   requireNonEmpty(config, errors, 'FINNHUB_API_KEY');
